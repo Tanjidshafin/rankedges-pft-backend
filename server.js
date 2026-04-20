@@ -57,17 +57,36 @@ initializeFirebaseAdmin();
 const db = admin.firestore();
 const FieldValue = admin.firestore.FieldValue;
 
-app.use(cors({
+const DEFAULT_DEV_ORIGINS = [
+  'http://localhost:8080',
+  'http://127.0.0.1:8080',
+  'http://localhost:5173',
+  'http://127.0.0.1:5173',
+];
+
+function getAllowedOrigins() {
+  const configured = (process.env.ALLOWED_ORIGINS || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+  return [...new Set([...configured, ...DEFAULT_DEV_ORIGINS])];
+}
+
+const corsOptions = {
   origin: (origin, callback) => {
-    const allowedOrigins = (process.env.ALLOWED_ORIGINS || '').split(',').map((item) => item.trim()).filter(Boolean);
-    if (!origin || allowedOrigins.length === 0 || allowedOrigins.includes(origin)) {
+    const allowedOrigins = getAllowedOrigins();
+    if (!origin || allowedOrigins.includes(origin)) {
       callback(null, true);
       return;
     }
     callback(new Error('Origin not allowed by CORS.'));
   },
   credentials: true,
-}));
+};
+
+app.use(cors(corsOptions));
+app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '2mb' }));
 
 const COLLECTIONS = {
