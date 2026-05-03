@@ -172,28 +172,50 @@ function requireCronSecret(req, res, next) {
   next();
 }
 
+function resolveMetaApiTokenCandidates(account, settings) {
+  const candidates = [
+    account?.metaapi_token,
+    process.env.METAAPI_TOKEN,
+    settings?.metaapi_token,
+  ].filter(Boolean);
+
+  return [...new Set(candidates)];
+}
+
+function isMetaApiAuthError(error) {
+  const message = String(error instanceof Error ? error.message : error || '').toLowerCase();
+  return message.includes('401') || message.includes('403');
+}
+
+async function requestMetaApiAccountDetailsWithTokens(accountId, tokens) {
+  let lastError;
+
+  for (const token of tokens) {
+    try {
+      const data = await fetchMetaApiAccountDetails(accountId, token);
+      return { token, data };
+    } catch (error) {
+      lastError = error;
+      if (!isMetaApiAuthError(error)) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError || new Error('MetaApi account-details request failed with authorization error.');
+}
+
 async function getMetaApiAccountInfo(account) {
   const settings = await getSiteSettings();
-  const token = account.metaapi_token || process.env.METAAPI_TOKEN || settings.metaapi_token;
-  if (!account.metaapi_account_id || !token) {
+  const tokenCandidates = resolveMetaApiTokenCandidates(account, settings);
+  if (!account.metaapi_account_id || tokenCandidates.length === 0) {
     throw new Error(`MetaApi credentials missing for account ${account.login || account.id || account.metaapi_account_id}.`);
   }
 
-  const regionResponse = await fetch(
-    `https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai/users/current/accounts/${account.metaapi_account_id}`,
-    {
-      headers: {
-        'auth-token': token,
-        'Content-Type': 'application/json',
-      },
-    },
+  const { token, data: regionPayload } = await requestMetaApiAccountDetailsWithTokens(
+    account.metaapi_account_id,
+    tokenCandidates,
   );
-
-  if (!regionResponse.ok) {
-    throw new Error(`MetaApi account-details request failed with ${regionResponse.status}.`);
-  }
-
-  const regionPayload = await regionResponse.json();
   const region = account.metaapi_region || regionPayload.region || 'new-york';
   const clientApiUrl = `https://mt-client-api-v1.${region}.agiliumtrade.ai`;
   const infoResponse = await fetch(
@@ -351,12 +373,15 @@ async function fetchMetaApiPositions(account, token, region) {
 
 async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled') {
   const settings = await getSiteSettings();
-  const token = account.metaapi_token || process.env.METAAPI_TOKEN || settings.metaapi_token;
-  if (!account.metaapi_account_id || !token) {
+  const tokenCandidates = resolveMetaApiTokenCandidates(account, settings);
+  if (!account.metaapi_account_id || tokenCandidates.length === 0) {
     throw new Error(`MetaApi credentials missing for account ${account.login || account.id || account.metaapi_account_id}.`);
   }
 
-  const regionPayload = await fetchMetaApiAccountDetails(account.metaapi_account_id, token);
+  const { token, data: regionPayload } = await requestMetaApiAccountDetailsWithTokens(
+    account.metaapi_account_id,
+    tokenCandidates,
+  );
   const region = account.metaapi_region || regionPayload.region || 'new-york';
   const accountInfo = await fetchMetaApiAccountInfo(account, token, region);
   const rawDeals = await fetchMetaApiTrades(account, token, undefined, undefined, region);
@@ -420,9 +445,13 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled') {
   await writeDocuments(COLLECTIONS.metaApiPositions, normalizedPositions);
 
   const totalProfit = normalizedDeals.reduce((sum, item) => sum + Number(item.data.profit || 0), 0);
-  const totalTrades = normalizedDeals.filter((item) => ['DEAL_TYPE_BUY', 'DEAL_TYPE_SELL'].includes(item.data.type)).length;
+  const tradeDeals = normalizedDeals.filter((item) => ['DEAL_TYPE_BUY', 'DEAL_TYPE_SELL'].includes(item.data.type));
+  const totalTrades = tradeDeals.length;
+  const winningTrades = tradeDeals.filter((item) => Number(item.data.profit || 0) > 0).length;
+  const winRate = totalTrades > 0 ? Number(((winningTrades / totalTrades) * 100).toFixed(2)) : 0;
   const initialBalance = Number(accountInfo.balance || 0) - totalProfit;
   const gain = Number.isFinite(initialBalance) && initialBalance > 0 ? Number(((totalProfit / initialBalance) * 100).toFixed(2)) : 0;
+  const drawdown = resolveDrawdownAtCapture(accountInfo);
 
   const accountSnapshot = {
     user_id: account.user_id,
@@ -450,9 +479,9 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled') {
     balance: Number(accountInfo.balance || 0),
     equity: Number(accountInfo.equity || 0),
     gain,
-    dd: Number(account.dd || 0),
+    dd: drawdown !== null ? Number(drawdown) : Number(account.dd || 0),
     profit: Number(totalProfit.toFixed(2)),
-    win_rate: Number(account.win_rate || 0),
+    win_rate: winRate,
     total_trades: totalTrades,
     metaapi_region: region,
     last_metaapi_sync_at: nowIso,
