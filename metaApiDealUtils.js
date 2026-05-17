@@ -1,6 +1,7 @@
 /**
  * Mirrors src/services/metaApiDealNormalization + metrics derivation for server-side MetaApi sync.
  */
+const { formatMetaApiHttpError } = require('./metaApiHttpErrors');
 const HISTORY_DEALS_PAGE_LIMIT = 1000;
 
 const MT5_CLOSE_ENTRIES = new Set(['DEAL_ENTRY_OUT', 'DEAL_ENTRY_INOUT', 'DEAL_ENTRY_OUT_BY']);
@@ -146,8 +147,7 @@ async function fetchMetaApiHistoryDealsPaginated(clientApiUrl, accountId, authTo
       },
     });
     if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`MetaApi trades request failed with ${response.status}: ${text.slice(0, 200)}`);
+      throw new Error(await formatMetaApiHttpError('history-deals', response, { accountId }));
     }
     const batch = await response.json();
     const rows = Array.isArray(batch) ? batch : [];

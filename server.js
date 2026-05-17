@@ -7,6 +7,7 @@ const {
   fetchMetaApiHistoryDealsPaginated,
   deriveSyncedMetricsPackage,
 } = require('./metaApiDealUtils');
+const { formatMetaApiHttpError } = require('./metaApiHttpErrors');
 const app = express();
 const PORT = Number(process.env.PORT || 3001);
 const DEFAULT_TOP_200_SIZE = 200;
@@ -237,23 +238,9 @@ async function getMetaApiAccountInfo(account) {
     account.metaapi_account_id,
     tokenCandidates,
   );
-  const region = account.metaapi_region || regionPayload.region || 'new-york';
-  const clientApiUrl = `https://mt-client-api-v1.${region}.agiliumtrade.ai`;
-  const infoResponse = await fetch(
-    `${clientApiUrl}/users/current/accounts/${account.metaapi_account_id}/account-information?refreshTerminalState=true`,
-    {
-      headers: {
-        'auth-token': token,
-        'Content-Type': 'application/json',
-      },
-    },
-  );
-
-  if (!infoResponse.ok) {
-    throw new Error(`MetaApi account-info request failed with ${infoResponse.status}.`);
-  }
-
-  return infoResponse.json();
+  assertProvisioningReadyForClientApi(regionPayload, account.metaapi_account_id);
+  const region = resolveMetaApiHostedRegion(regionPayload, account);
+  return fetchMetaApiAccountInfo(account, token, region);
 }
 
 function isTransientMetaApiError(error) {
@@ -320,7 +307,9 @@ async function fetchMetaApiAccountDetails(accountId, token) {
   });
 
   if (!response.ok) {
-    throw new Error(`MetaApi account-details request failed with ${response.status}.`);
+    throw new Error(
+      await formatMetaApiHttpError('account-details (provisioning)', response, { accountId }),
+    );
   }
 
   return response.json();
@@ -330,24 +319,112 @@ function getClientApiUrl(region = 'new-york') {
   return `https://mt-client-api-v1.${region}.agiliumtrade.ai`;
 }
 
-async function fetchMetaApiAccountInfo(account, token, region) {
-  const resolvedRegion = region || account.metaapi_region || 'new-york';
-  const clientApiUrl = getClientApiUrl(resolvedRegion);
-  const response = await fetch(
-    `${clientApiUrl}/users/current/accounts/${account.metaapi_account_id}/account-information?refreshTerminalState=true`,
-    {
-      headers: {
-        'auth-token': token,
-        'Content-Type': 'application/json',
-      },
-    },
-  );
+/** Prefer region from provisioning API — wrong region causes timeouts / wrong-datacenter URLs. */
+function resolveMetaApiHostedRegion(regionPayload, account) {
+  const fromProvisioning =
+    regionPayload && typeof regionPayload.region === 'string' && regionPayload.region.trim()
+      ? regionPayload.region.trim()
+      : '';
+  const fromDoc =
+    account && typeof account.metaapi_region === 'string' && account.metaapi_region.trim()
+      ? account.metaapi_region.trim()
+      : '';
+  return fromProvisioning || fromDoc || 'new-york';
+}
 
-  if (!response.ok) {
-    throw new Error(`MetaApi account-info request failed with ${response.status}.`);
+/** Fast-fail with actionable messaging before hammering RPC that often 504s. */
+function assertProvisioningReadyForClientApi(provisioningPayload, metaapiAccountId) {
+  if (!provisioningPayload || typeof provisioningPayload !== 'object') return;
+
+  const { state } = provisioningPayload;
+  const connectionStatus =
+    provisioningPayload.connectionStatus ?? provisioningPayload.connection_status;
+  const masked = metaapiAccountId ? maskAccountReference(metaapiAccountId) : '';
+  const stateNormalized = typeof state === 'string' ? state.toUpperCase() : '';
+
+  if (stateNormalized === 'DEPLOY_FAILED') {
+    throw new Error(
+      `MetaApi deployment failed for ${masked}; fix or redeploy this account in MetaApi Cloud before syncing.`,
+    );
   }
 
-  return response.json();
+  if (stateNormalized === 'DEPLOYING') {
+    throw new Error(
+      `MetaApi account ${masked} is still deploying (state=${state}). Wait until the dashboard shows DEPLOYED, then sync again.`,
+    );
+  }
+
+  if (typeof connectionStatus === 'string' && connectionStatus.toUpperCase() === 'DISCONNECTED') {
+    throw new Error(
+      `MetaApi broker RPC is disconnected for ${masked}. Keep MetaTrader logged in to your broker so the EA/connector can reach the terminal; retry sync after MetaApi shows a connected state.`,
+    );
+  }
+}
+
+/**
+ * Prefer cached/light client API calls before refreshTerminalState=true (often 504s when broker RPC is busy).
+ */
+async function fetchMetaApiAccountInfo(account, token, region) {
+  const resolvedRegion =
+    (typeof region === 'string' && region.trim()) || account.metaapi_region || 'new-york';
+  const clientApiUrl = getClientApiUrl(resolvedRegion);
+  const base = `${clientApiUrl}/users/current/accounts/${account.metaapi_account_id}/account-information`;
+  const headers = {
+    'auth-token': token,
+    'Content-Type': 'application/json',
+  };
+  const transient = new Set([504, 408, 502, 503]);
+  const extras = { region: resolvedRegion, accountId: account.metaapi_account_id };
+
+  async function fetchWithTransientRetries(label, href, maxAttempts) {
+    let lastTransientSummary = '';
+    for (let attempt = 0; attempt < maxAttempts; attempt += 1) {
+      if (attempt > 0) await delay(2500 + attempt * 500);
+      const response = await fetch(href, { headers });
+      if (response.ok) {
+        return { ok: true, data: await response.json() };
+      }
+      const summary = await formatMetaApiHttpError(label, response, extras);
+      if (!transient.has(response.status)) {
+        throw new Error(summary);
+      }
+      lastTransientSummary = summary;
+    }
+    return { ok: false, summary: lastTransientSummary };
+  }
+
+  const phases = [
+    { label: 'account-information (cached snapshot)', href: base, tries: 5 },
+    {
+      label: 'account-information (?refreshTerminalState=false)',
+      href: `${base}?refreshTerminalState=false`,
+      tries: 3,
+    },
+    {
+      label: 'account-information (refreshTerminalState=true)',
+      href: `${base}?refreshTerminalState=true`,
+      tries: 3,
+    },
+  ];
+
+  const failed = [];
+  for (const phase of phases) {
+    const outcome = await fetchWithTransientRetries(phase.label, phase.href, phase.tries);
+    if (outcome.ok) return outcome.data;
+    failed.push(outcome.summary);
+  }
+
+  throw new Error(
+    [
+      'MetaApi timed out repeatedly on account-information (all phases). This almost always means the hosted terminal broker link is unavailable or overloaded.',
+      '',
+      'Checks: MetaTrader stays logged into the broker matching this account; leave the MetaApi EA/connector running; confirm MetaApi Cloud lists this account as DEPLOYED; fix billing/credits if MetaApi shows quota warnings.',
+      '',
+      `[region: ${resolvedRegion}] [MetaApi account: ${account.metaapi_account_id}]`,
+      '[Last phase summaries below]',
+      ...failed.map((line, idx) => `  (${idx + 1}) ${line}`),
+    ].join('\n'),
+  );
 }
 
 async function fetchMetaApiTrades(account, token, startTime, endTime, region) {
@@ -372,7 +449,12 @@ async function fetchMetaApiPositions(account, token, region) {
   );
 
   if (!response.ok) {
-    throw new Error(`MetaApi positions request failed with ${response.status}.`);
+    throw new Error(
+      await formatMetaApiHttpError('positions', response, {
+        region: resolvedRegion,
+        accountId: account.metaapi_account_id,
+      }),
+    );
   }
 
   return response.json();
@@ -389,7 +471,8 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled') {
     account.metaapi_account_id,
     tokenCandidates,
   );
-  const region = account.metaapi_region || regionPayload.region || 'new-york';
+  assertProvisioningReadyForClientApi(regionPayload, account.metaapi_account_id);
+  const region = resolveMetaApiHostedRegion(regionPayload, account);
   const accountInfo = await fetchMetaApiAccountInfo(account, token, region);
   const rawDeals = await fetchMetaApiTrades(account, token, undefined, undefined, region);
   const rawPositions = await fetchMetaApiPositions(account, token, region);
