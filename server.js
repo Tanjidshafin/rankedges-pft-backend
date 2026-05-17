@@ -3,6 +3,10 @@ const express = require('express');
 const cors = require('cors');
 const cron = require('node-cron');
 const admin = require('firebase-admin');
+const {
+  fetchMetaApiHistoryDealsPaginated,
+  deriveSyncedMetricsPackage,
+} = require('./metaApiDealUtils');
 const app = express();
 const PORT = Number(process.env.PORT || 3001);
 const DEFAULT_TOP_200_SIZE = 200;
@@ -130,6 +134,23 @@ async function updateSiteSettings(partial) {
   await db.collection(COLLECTIONS.settings).doc(SETTINGS_DOC_ID).set(partial, { merge: true });
 }
 
+async function requireUser(req, res, next) {
+  try {
+    const authHeader = req.headers.authorization || '';
+    const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+    if (!token) {
+      res.status(401).json({ error: 'Missing Firebase ID token.' });
+      return;
+    }
+
+    const decoded = await admin.auth().verifyIdToken(token);
+    req.firebaseUser = { uid: decoded.uid, email: decoded.email || '' };
+    next();
+  } catch (error) {
+    res.status(401).json({ error: error instanceof Error ? error.message : 'Invalid auth token.' });
+  }
+}
+
 async function requireAdmin(req, res, next) {
   try {
     const authHeader = req.headers.authorization || '';
@@ -219,7 +240,7 @@ async function getMetaApiAccountInfo(account) {
   const region = account.metaapi_region || regionPayload.region || 'new-york';
   const clientApiUrl = `https://mt-client-api-v1.${region}.agiliumtrade.ai`;
   const infoResponse = await fetch(
-    `${clientApiUrl}/users/current/accounts/${account.metaapi_account_id}/account-information`,
+    `${clientApiUrl}/users/current/accounts/${account.metaapi_account_id}/account-information?refreshTerminalState=true`,
     {
       headers: {
         'auth-token': token,
@@ -313,7 +334,7 @@ async function fetchMetaApiAccountInfo(account, token, region) {
   const resolvedRegion = region || account.metaapi_region || 'new-york';
   const clientApiUrl = getClientApiUrl(resolvedRegion);
   const response = await fetch(
-    `${clientApiUrl}/users/current/accounts/${account.metaapi_account_id}/account-information`,
+    `${clientApiUrl}/users/current/accounts/${account.metaapi_account_id}/account-information?refreshTerminalState=true`,
     {
       headers: {
         'auth-token': token,
@@ -334,21 +355,7 @@ async function fetchMetaApiTrades(account, token, startTime, endTime, region) {
   const clientApiUrl = getClientApiUrl(resolvedRegion);
   const start = startTime || new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
   const end = endTime || new Date().toISOString();
-  const response = await fetch(
-    `${clientApiUrl}/users/current/accounts/${account.metaapi_account_id}/history-deals/time/${encodeURIComponent(start)}/${encodeURIComponent(end)}`,
-    {
-      headers: {
-        'auth-token': token,
-        'Content-Type': 'application/json',
-      },
-    },
-  );
-
-  if (!response.ok) {
-    throw new Error(`MetaApi trades request failed with ${response.status}.`);
-  }
-
-  return response.json();
+  return fetchMetaApiHistoryDealsPaginated(clientApiUrl, account.metaapi_account_id, token, start, end);
 }
 
 async function fetchMetaApiPositions(account, token, region) {
@@ -387,26 +394,39 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled') {
   const rawDeals = await fetchMetaApiTrades(account, token, undefined, undefined, region);
   const rawPositions = await fetchMetaApiPositions(account, token, region);
 
+  const platform =
+    account.platform === 'mt4' || account.platform === 'mt5'
+      ? account.platform
+      : accountInfo.platform === 'mt4' || accountInfo.platform === 'mt5'
+        ? accountInfo.platform
+        : 'mt5';
+
   const nowIso = new Date().toISOString();
   const syncRunId = `${account.id || account.metaapi_account_id}-${Date.now()}`;
 
-  const normalizedDeals = (Array.isArray(rawDeals) ? rawDeals : []).map((deal) => ({
-    id: `${account.id || account.metaapi_account_id}_${deal.id}`,
+  const { normalizedTrades, metrics } = deriveSyncedMetricsPackage(
+    Number(accountInfo.balance || 0),
+    Array.isArray(rawDeals) ? rawDeals : [],
+    platform,
+  );
+
+  const normalizedDeals = normalizedTrades.map((trade) => ({
+    id: `${account.id || account.metaapi_account_id}_${trade.id}`,
     data: {
       user_id: account.user_id,
       account_id: account.id || account.metaapi_account_id,
       account_login: account.login || '',
-      symbol: deal.symbol,
-      type: deal.type,
-      volume: Number(deal.volume || 0),
-      openPrice: Number(deal.price || 0),
-      closePrice: Number(deal.price || 0),
-      profit: Number(deal.profit || 0),
-      openTime: deal.time,
-      closeTime: deal.time,
-      swap: Number(deal.swap || 0),
-      commission: Number(deal.commission || 0),
-      comment: deal.comment || null,
+      symbol: trade.symbol,
+      type: trade.type,
+      volume: Number(trade.volume || 0),
+      openPrice: Number(trade.openPrice || 0),
+      closePrice: Number(trade.closePrice || 0),
+      profit: Number(trade.profit || 0),
+      openTime: trade.openTime,
+      closeTime: trade.closeTime,
+      swap: Number(trade.swap || 0),
+      commission: Number(trade.commission || 0),
+      comment: trade.comment || null,
       metaapi_account_id: account.metaapi_account_id,
       metaapi_region: region,
       synced_at: nowIso,
@@ -444,14 +464,13 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled') {
   await writeDocuments(COLLECTIONS.metaApiTrades, normalizedDeals);
   await writeDocuments(COLLECTIONS.metaApiPositions, normalizedPositions);
 
-  const totalProfit = normalizedDeals.reduce((sum, item) => sum + Number(item.data.profit || 0), 0);
-  const tradeDeals = normalizedDeals.filter((item) => ['DEAL_TYPE_BUY', 'DEAL_TYPE_SELL'].includes(item.data.type));
-  const totalTrades = tradeDeals.length;
-  const winningTrades = tradeDeals.filter((item) => Number(item.data.profit || 0) > 0).length;
-  const winRate = totalTrades > 0 ? Number(((winningTrades / totalTrades) * 100).toFixed(2)) : 0;
-  const initialBalance = Number(accountInfo.balance || 0) - totalProfit;
-  const gain = Number.isFinite(initialBalance) && initialBalance > 0 ? Number(((totalProfit / initialBalance) * 100).toFixed(2)) : 0;
-  const drawdown = resolveDrawdownAtCapture(accountInfo);
+  const drawdownFromBroker = resolveDrawdownAtCapture(accountInfo);
+  const dd =
+    normalizedTrades.length > 0 && Number.isFinite(metrics.dd)
+      ? metrics.dd
+      : drawdownFromBroker !== null && drawdownFromBroker !== undefined
+        ? Number(drawdownFromBroker)
+        : Number(account.dd || 0);
 
   const accountSnapshot = {
     user_id: account.user_id,
@@ -478,11 +497,11 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled') {
   await db.collection(COLLECTIONS.accounts).doc(String(account.id || account.metaapi_account_id)).set({
     balance: Number(accountInfo.balance || 0),
     equity: Number(accountInfo.equity || 0),
-    gain,
-    dd: drawdown !== null ? Number(drawdown) : Number(account.dd || 0),
-    profit: Number(totalProfit.toFixed(2)),
-    win_rate: winRate,
-    total_trades: totalTrades,
+    gain: metrics.gain,
+    dd,
+    profit: metrics.profit,
+    win_rate: metrics.win_rate,
+    total_trades: metrics.total_trades,
     metaapi_region: region,
     last_metaapi_sync_at: nowIso,
     metaapi_sync_status: 'success',
@@ -1116,6 +1135,138 @@ async function captureEndedBatchesInternal(requestedBy = 'cron') {
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'rankedges-pft-backend' });
+});
+
+/**
+ * Owner-only: triggers server-side MetaApi snapshot (same path as cron) to save browser MetaApi credits.
+ */
+app.post('/api/meta-api/sync-account/:accountFirestoreId', requireUser, async (req, res) => {
+  try {
+    const accountFirestoreId = String(req.params.accountFirestoreId || '');
+    if (!accountFirestoreId) {
+      res.status(400).json({ error: 'accountFirestoreId is required.' });
+      return;
+    }
+
+    const accountSnap = await db.collection(COLLECTIONS.accounts).doc(accountFirestoreId).get();
+    if (!accountSnap.exists) {
+      res.status(404).json({ error: 'Trading account not found.' });
+      return;
+    }
+
+    const data = accountSnap.data();
+    if (data.user_id !== req.firebaseUser.uid) {
+      res.status(403).json({ error: 'You can only sync your own trading accounts.' });
+      return;
+    }
+
+    const settingsForTokens = await getSiteSettings();
+    const tokenCandidates = resolveMetaApiTokenCandidates({ ...data, id: accountSnap.id }, settingsForTokens);
+    if (!data.metaapi_account_id || tokenCandidates.length === 0) {
+      res.status(400).json({ error: 'MetaApi credentials missing for this account.' });
+      return;
+    }
+
+    if (data.metaapi_sync_status === 'running') {
+      res.status(409).json({ error: 'A sync is already in progress for this account.' });
+      return;
+    }
+
+    const account = { id: accountSnap.id, ...data };
+
+    await db.collection(COLLECTIONS.accounts).doc(accountSnap.id).set(
+      {
+        metaapi_sync_status: 'running',
+        metaapi_sync_error: null,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+
+    const result = await syncMetaApiAccountSnapshot(account, 'user_ui');
+    res.json({ ok: true, accountId: accountSnap.id, ...result });
+  } catch (error) {
+    const accountIdParam = String(req.params.accountFirestoreId || '');
+    if (accountIdParam) {
+      try {
+        await db.collection(COLLECTIONS.accounts).doc(accountIdParam).set(
+          {
+            metaapi_sync_status: 'error',
+            metaapi_sync_error: error instanceof Error ? error.message : String(error),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+      } catch (_) {
+        // ignore secondary failure
+      }
+    }
+    res.status(500).json({ error: error instanceof Error ? error.message : 'MetaApi sync failed.' });
+  }
+});
+
+app.post('/api/meta-api/admin/sync-account', requireAdmin, async (req, res) => {
+  try {
+    const accountId = String((req.body && req.body.accountId) || '');
+    if (!accountId) {
+      res.status(400).json({ error: 'accountId is required.' });
+      return;
+    }
+
+    const accountSnap = await db.collection(COLLECTIONS.accounts).doc(accountId).get();
+    if (!accountSnap.exists) {
+      res.status(404).json({ error: 'Trading account not found.' });
+      return;
+    }
+
+    const data = accountSnap.data();
+    const adminSettings = await getSiteSettings();
+    const adminCandidates = resolveMetaApiTokenCandidates({ ...data, id: accountSnap.id }, adminSettings);
+    if (!data.metaapi_account_id || adminCandidates.length === 0) {
+      res.status(400).json({ error: 'MetaApi credentials missing for this account.' });
+      return;
+    }
+
+    const account = { id: accountSnap.id, ...data };
+
+    await db.collection(COLLECTIONS.accounts).doc(accountSnap.id).set(
+      {
+        metaapi_sync_status: 'running',
+        metaapi_sync_error: null,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+
+    const result = await syncMetaApiAccountSnapshot(account, 'admin_ui');
+    res.json({ ok: true, accountId: accountSnap.id, ...result });
+  } catch (error) {
+    const aid = String((req.body && req.body.accountId) || '');
+    if (aid) {
+      try {
+        await db.collection(COLLECTIONS.accounts).doc(aid).set(
+          {
+            metaapi_sync_status: 'error',
+            metaapi_sync_error: error instanceof Error ? error.message : String(error),
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+      } catch (_) {
+        /* empty */
+      }
+    }
+    res.status(500).json({ error: error instanceof Error ? error.message : 'MetaApi sync failed.' });
+  }
+});
+
+app.post('/api/meta-api/admin/sync-all', requireAdmin, async (_req, res) => {
+  try {
+    const summary = await syncAllMetaApiAccountsInternal('admin_manual');
+    res.json(summary);
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'MetaApi sync-all failed.' });
+  }
 });
 
 app.post('/api/pft/program/ensure', requireAdmin, async (req, res) => {
