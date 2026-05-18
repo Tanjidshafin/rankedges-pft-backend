@@ -57,6 +57,17 @@ function resolveTradesMode(requestedBy, options = {}) {
     return METAAPI_TRADES_FULL;
   }
 
+  // Owner connect / POST /api/meta-api/sync-account — default metrics-only so connect does not exhaust Spark daily writes.
+  if (requestedBy === 'user_ui') {
+    const uiRaw = process.env.METAAPI_SYNC_USER_UI_TRADES_MODE;
+    const uiExplicit =
+      uiRaw !== undefined && String(uiRaw).trim() !== ''
+        ? normalizeTradesMode(uiRaw)
+        : undefined;
+    if (uiExplicit === METAAPI_TRADES_FULL || uiExplicit === METAAPI_TRADES_METRICS_ONLY) return uiExplicit;
+    return METAAPI_TRADES_METRICS_ONLY;
+  }
+
   const global = normalizeTradesMode(process.env.METAAPI_SYNC_TRADES_MODE || METAAPI_TRADES_FULL);
   return global === METAAPI_TRADES_METRICS_ONLY ? METAAPI_TRADES_METRICS_ONLY : METAAPI_TRADES_FULL;
 }
