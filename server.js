@@ -7,7 +7,20 @@ const {
   fetchMetaApiHistoryDealsPaginated,
   deriveSyncedMetricsPackage,
 } = require('./metaApiDealUtils');
+const {
+  fetchMetaStatsMetrics,
+  mapMetaStatsToAccountMetrics,
+  safeJsonSnippet,
+  slimMetaStatsForStorage,
+  MetaStatsFetchError,
+} = require('./metaApiMetaStats');
+const {
+  enableMetaStatsForAccount,
+  deployProvisioningAccount,
+  waitForProvisioningDeployed,
+} = require('./metaApiProvisioningFeatures');
 const { formatMetaApiHttpError } = require('./metaApiHttpErrors');
+const { assertMetaApiCloudAccountId } = require('./metaApiProvisioningId');
 const app = express();
 const PORT = Number(process.env.PORT || 3001);
 const DEFAULT_TOP_200_SIZE = 200;
@@ -286,16 +299,35 @@ async function deleteDocumentsByField(collectionName, fieldName, fieldValue) {
   return deleted;
 }
 
+async function commitFirestoreWriteChunk(collectionName, chunk) {
+  const batch = db.batch();
+  chunk.forEach(({ id, data }) => {
+    const payload = omitUndefinedFirestoreFields(data);
+    batch.set(db.collection(collectionName).doc(id), payload, { merge: false });
+  });
+  await batch.commit();
+}
+
 async function writeDocuments(collectionName, docs) {
   if (docs.length === 0) return;
   const chunks = chunkArray(docs, 400);
-  for (const chunk of chunks) {
-    const batch = db.batch();
-    chunk.forEach(({ id, data }) => {
-      batch.set(db.collection(collectionName).doc(id), data, { merge: false });
-    });
-    await batch.commit();
+  const concurrency = Math.max(1, Math.min(8, Number(process.env.FIRESTORE_WRITE_CONCURRENCY || 4)));
+  for (let index = 0; index < chunks.length; index += concurrency) {
+    await Promise.all(
+      chunks.slice(index, index + concurrency).map((chunk) => commitFirestoreWriteChunk(collectionName, chunk)),
+    );
   }
+}
+
+/** Firestore rejects `undefined` field values. */
+function omitUndefinedFirestoreFields(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  const out = {};
+  for (const key of Object.keys(obj)) {
+    const v = obj[key];
+    if (v !== undefined) out[key] = v;
+  }
+  return out;
 }
 
 async function fetchMetaApiAccountDetails(accountId, token) {
@@ -460,22 +492,69 @@ async function fetchMetaApiPositions(account, token, region) {
   return response.json();
 }
 
-async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled') {
-  const settings = await getSiteSettings();
-  const tokenCandidates = resolveMetaApiTokenCandidates(account, settings);
-  if (!account.metaapi_account_id || tokenCandidates.length === 0) {
-    throw new Error(`MetaApi credentials missing for account ${account.login || account.id || account.metaapi_account_id}.`);
-  }
+async function fetchMetaStatsWithProvisioningRecovery(metaapiCloudAccountId, token, region) {
+  try {
+    return await fetchMetaStatsMetrics(metaapiCloudAccountId, token, region, {
+      includeOpenPositions: true,
+    });
+  } catch (err) {
+    const snippet = `${err.bodyText} ${err.message}`;
+    const isForbiddenMetaStats =
+      err instanceof MetaStatsFetchError &&
+      err.status === 403 &&
+      /\benable-account-features|enable.?metastats|metastatsapi|ForbiddenError|"forbiddenerror"|metastats api\b/i.test(
+        snippet,
+      );
 
-  const { token, data: regionPayload } = await requestMetaApiAccountDetailsWithTokens(
-    account.metaapi_account_id,
-    tokenCandidates,
-  );
-  assertProvisioningReadyForClientApi(regionPayload, account.metaapi_account_id);
-  const region = resolveMetaApiHostedRegion(regionPayload, account);
-  const accountInfo = await fetchMetaApiAccountInfo(account, token, region);
-  const rawDeals = await fetchMetaApiTrades(account, token, undefined, undefined, region);
-  const rawPositions = await fetchMetaApiPositions(account, token, region);
+    if (!isForbiddenMetaStats) {
+      console.error('[MetaStats][error]', err);
+      throw err;
+    }
+
+    console.error(
+      '[MetaStats][recovery] HTTP 403 from MetaStats (full MetaApi body for debugging):',
+      typeof err.bodyText === 'string' ? err.bodyText : String(err.bodyText || ''),
+    );
+
+    const en = await enableMetaStatsForAccount(metaapiCloudAccountId, token);
+    if (!(en.ok || en.status === 204)) {
+      console.error('[MetaStats][recovery] provision enable-metastats-api failed:', en.status, en.text);
+      throw new Error(
+        `MetaStats is disabled on this MetaApi account (${en.status}). ${en.text.slice(0, 800)} Enable MetaStats in MetaApi Cloud (account → features), ensure billing allows it (paid option), then sync again.`,
+      );
+    }
+
+    const deployRes = await deployProvisioningAccount(metaapiCloudAccountId, token);
+    if (!deployRes.ok) {
+      console.warn(
+        '[MetaStats][recovery] Provision deploy HTTP',
+        deployRes.status,
+        deployRes.text.slice(0, 500),
+      );
+    }
+
+    const deployed = await waitForProvisioningDeployed(metaapiCloudAccountId, token);
+    if (!deployed) {
+      throw new Error(
+        'MetaStats was enabled in MetaApi; the account is still redeploying. Wait 60–120 seconds, then retry connect or Admin → Sync.',
+      );
+    }
+
+    console.log('[MetaStats][recovery] Retrying metastats metrics after deploy…');
+
+    return await fetchMetaStatsMetrics(metaapiCloudAccountId, token, region, {
+      includeOpenPositions: true,
+    });
+  }
+}
+
+function logSyncPhase(accountKey, label, startedMs) {
+  console.log(`[MetaApi sync][${accountKey}] ${label} ${Date.now() - startedMs}ms`);
+}
+
+async function syncMetaApiTradeDocuments(account, accountForMetaApi, token, region, accountInfo, syncRunId, nowIso) {
+  const accountKey = account.id || account.metaapi_account_id;
+  const phaseStart = Date.now();
 
   const platform =
     account.platform === 'mt4' || account.platform === 'mt5'
@@ -484,32 +563,35 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled') {
         ? accountInfo.platform
         : 'mt5';
 
-  const nowIso = new Date().toISOString();
-  const syncRunId = `${account.id || account.metaapi_account_id}-${Date.now()}`;
+  const [rawDeals, rawPositions] = await Promise.all([
+    fetchMetaApiTrades(accountForMetaApi, token, undefined, undefined, region),
+    fetchMetaApiPositions(accountForMetaApi, token, region),
+  ]);
+  logSyncPhase(accountKey, `fetched deals=${Array.isArray(rawDeals) ? rawDeals.length : 0}`, phaseStart);
 
-  const { normalizedTrades, metrics } = deriveSyncedMetricsPackage(
+  const { normalizedTrades } = deriveSyncedMetricsPackage(
     Number(accountInfo.balance || 0),
     Array.isArray(rawDeals) ? rawDeals : [],
     platform,
   );
 
   const normalizedDeals = normalizedTrades.map((trade) => ({
-    id: `${account.id || account.metaapi_account_id}_${trade.id}`,
+    id: `${accountKey}_${trade.id}`,
     data: {
       user_id: account.user_id,
-      account_id: account.id || account.metaapi_account_id,
+      account_id: accountKey,
       account_login: account.login || '',
-      symbol: trade.symbol,
+      symbol: trade.symbol || '',
       type: trade.type,
       volume: Number(trade.volume || 0),
       openPrice: Number(trade.openPrice || 0),
       closePrice: Number(trade.closePrice || 0),
       profit: Number(trade.profit || 0),
-      openTime: trade.openTime,
-      closeTime: trade.closeTime,
+      openTime: trade.openTime ?? null,
+      closeTime: trade.closeTime ?? null,
       swap: Number(trade.swap || 0),
       commission: Number(trade.commission || 0),
-      comment: trade.comment || null,
+      comment: trade.comment ?? null,
       metaapi_account_id: account.metaapi_account_id,
       metaapi_region: region,
       synced_at: nowIso,
@@ -519,18 +601,18 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled') {
   }));
 
   const normalizedPositions = (Array.isArray(rawPositions) ? rawPositions : []).map((position) => ({
-    id: `${account.id || account.metaapi_account_id}_${position.id}`,
+    id: `${accountKey}_${position.id}`,
     data: {
       user_id: account.user_id,
-      account_id: account.id || account.metaapi_account_id,
+      account_id: accountKey,
       account_login: account.login || '',
-      symbol: position.symbol,
+      symbol: position.symbol || '',
       type: position.type,
       volume: Number(position.volume || 0),
       openPrice: Number(position.openPrice || 0),
       currentPrice: Number(position.currentPrice || 0),
       profit: Number(position.profit || 0),
-      openTime: position.openTime,
+      openTime: position.openTime ?? null,
       swap: Number(position.swap || 0),
       commission: Number(position.commission || 0),
       metaapi_account_id: account.metaapi_account_id,
@@ -541,19 +623,127 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled') {
     },
   }));
 
-  await deleteDocumentsByField(COLLECTIONS.metaApiTrades, 'account_id', account.id || account.metaapi_account_id);
-  await deleteDocumentsByField(COLLECTIONS.metaApiPositions, 'account_id', account.id || account.metaapi_account_id);
+  const writeStart = Date.now();
+  await Promise.all([
+    writeDocuments(COLLECTIONS.metaApiTrades, normalizedDeals),
+    writeDocuments(COLLECTIONS.metaApiPositions, normalizedPositions),
+  ]);
+  logSyncPhase(
+    accountKey,
+    `wrote trades=${normalizedDeals.length} positions=${normalizedPositions.length}`,
+    writeStart,
+  );
 
-  await writeDocuments(COLLECTIONS.metaApiTrades, normalizedDeals);
-  await writeDocuments(COLLECTIONS.metaApiPositions, normalizedPositions);
+  return {
+    tradesSynced: normalizedDeals.length,
+    positionsSynced: normalizedPositions.length,
+  };
+}
 
-  const drawdownFromBroker = resolveDrawdownAtCapture(accountInfo);
-  const dd =
-    normalizedTrades.length > 0 && Number.isFinite(metrics.dd)
-      ? metrics.dd
-      : drawdownFromBroker !== null && drawdownFromBroker !== undefined
-        ? Number(drawdownFromBroker)
-        : Number(account.dd || 0);
+function shouldDeferTradeSync(requestedBy, options = {}) {
+  if (options.deferTradeSync === true) return true;
+  if (options.deferTradeSync === false || options.fullSync === true) return false;
+  return requestedBy === 'admin_ui' || requestedBy === 'user_ui';
+}
+
+async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', options = {}) {
+  const deferTradeSync = shouldDeferTradeSync(requestedBy, options);
+  const accountKey = account.id || account.metaapi_account_id;
+  const syncStarted = Date.now();
+
+  const settings = await getSiteSettings();
+  const tokenCandidates = resolveMetaApiTokenCandidates(account, settings);
+  if (!account.metaapi_account_id || tokenCandidates.length === 0) {
+    throw new Error(`MetaApi credentials missing for account ${account.login || accountKey}.`);
+  }
+
+  const metaapiCloudAccountId = assertMetaApiCloudAccountId(account.metaapi_account_id, account.login);
+  const accountForMetaApi = { ...account, metaapi_account_id: metaapiCloudAccountId };
+
+  const { token, data: regionPayload } = await requestMetaApiAccountDetailsWithTokens(
+    metaapiCloudAccountId,
+    tokenCandidates,
+  );
+  assertProvisioningReadyForClientApi(regionPayload, metaapiCloudAccountId);
+  const region = resolveMetaApiHostedRegion(regionPayload, accountForMetaApi);
+  const accountInfo = await fetchMetaApiAccountInfo(accountForMetaApi, token, region);
+  logSyncPhase(accountKey, 'account info', syncStarted);
+
+  const metaStatsRaw = await fetchMetaStatsWithProvisioningRecovery(metaapiCloudAccountId, token, region);
+  let mappedMetrics;
+  try {
+    mappedMetrics = mapMetaStatsToAccountMetrics(metaStatsRaw);
+  } catch (err) {
+    throw new Error(
+      `MetaStats metrics mapping failed for ${account.login || metaapiCloudAccountId}: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+  logSyncPhase(accountKey, 'metastats', syncStarted);
+
+  const nowIso = new Date().toISOString();
+  const syncRunId = `${accountKey}-${Date.now()}`;
+
+  const headlineBalance =
+    mappedMetrics.balance != null && Number.isFinite(mappedMetrics.balance)
+      ? mappedMetrics.balance
+      : Number(accountInfo.balance || 0);
+  const headlineEquity =
+    mappedMetrics.equity != null && Number.isFinite(mappedMetrics.equity)
+      ? mappedMetrics.equity
+      : Number(accountInfo.equity || 0);
+  const headlineGain = mappedMetrics.gain != null && Number.isFinite(mappedMetrics.gain) ? mappedMetrics.gain : 0;
+  const headlineDd = mappedMetrics.dd != null && Number.isFinite(mappedMetrics.dd) ? mappedMetrics.dd : 0;
+  const headlineProfit =
+    mappedMetrics.profit != null && Number.isFinite(mappedMetrics.profit) ? mappedMetrics.profit : 0;
+  const headlineWin =
+    mappedMetrics.win_rate != null && Number.isFinite(mappedMetrics.win_rate) ? mappedMetrics.win_rate : 0;
+  const headlineTotalTrades =
+    mappedMetrics.total_trades != null && Number.isFinite(mappedMetrics.total_trades)
+      ? mappedMetrics.total_trades
+      : 0;
+
+  const persistMeta = {
+    balance: headlineBalance,
+    equity: headlineEquity,
+    gain: headlineGain,
+    dd: headlineDd,
+    profit: headlineProfit,
+    win_rate: headlineWin,
+    total_trades: headlineTotalTrades,
+    metaapi_abs_gain:
+      mappedMetrics.metaapi_abs_gain != null && Number.isFinite(mappedMetrics.metaapi_abs_gain)
+        ? mappedMetrics.metaapi_abs_gain
+        : null,
+    metaapi_daily_gain:
+      mappedMetrics.metaapi_daily_gain != null && Number.isFinite(mappedMetrics.metaapi_daily_gain)
+        ? mappedMetrics.metaapi_daily_gain
+        : null,
+    metaapi_monthly_gain:
+      mappedMetrics.metaapi_monthly_gain != null && Number.isFinite(mappedMetrics.metaapi_monthly_gain)
+        ? mappedMetrics.metaapi_monthly_gain
+        : null,
+    metaapi_highest_balance:
+      mappedMetrics.metaapi_highest_balance != null &&
+      Number.isFinite(mappedMetrics.metaapi_highest_balance)
+        ? mappedMetrics.metaapi_highest_balance
+        : null,
+    metaapi_highest_balance_date: mappedMetrics.metaapi_highest_balance_date ?? null,
+    metaapi_interest:
+      mappedMetrics.metaapi_interest != null && Number.isFinite(mappedMetrics.metaapi_interest)
+        ? mappedMetrics.metaapi_interest
+        : null,
+    metaapi_deposits:
+      mappedMetrics.metaapi_deposits != null && Number.isFinite(mappedMetrics.metaapi_deposits)
+        ? mappedMetrics.metaapi_deposits
+        : null,
+    metaapi_withdrawals:
+      mappedMetrics.metaapi_withdrawals != null &&
+      Number.isFinite(mappedMetrics.metaapi_withdrawals)
+        ? mappedMetrics.metaapi_withdrawals
+        : null,
+    metaapi_metrics_synced_at: nowIso,
+  };
+  console.log('[MetaStats][persist]', safeJsonSnippet(persistMeta));
 
   const accountSnapshot = {
     user_id: account.user_id,
@@ -569,6 +759,8 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled') {
     server: String(accountInfo.server || ''),
     broker: String(accountInfo.broker || ''),
     raw: accountInfo,
+    meta_stats_metrics_raw: slimMetaStatsForStorage(metaStatsRaw),
+    meta_stats_metrics_mapped: mappedMetrics,
     metaapi_account_id: account.metaapi_account_id,
     metaapi_region: region,
     synced_at: nowIso,
@@ -576,28 +768,90 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled') {
     createdAt: FieldValue.serverTimestamp(),
   };
 
-  await db.collection(COLLECTIONS.metaApiAccountSnapshots).doc(String(account.id || account.metaapi_account_id)).set(accountSnapshot, { merge: false });
-  await db.collection(COLLECTIONS.accounts).doc(String(account.id || account.metaapi_account_id)).set({
-    balance: Number(accountInfo.balance || 0),
-    equity: Number(accountInfo.equity || 0),
-    gain: metrics.gain,
-    dd,
-    profit: metrics.profit,
-    win_rate: metrics.win_rate,
-    total_trades: metrics.total_trades,
-    metaapi_region: region,
-    last_metaapi_sync_at: nowIso,
-    metaapi_sync_status: 'success',
-    metaapi_sync_error: null,
-    metaapi_snapshot_version: FieldValue.increment(1),
-    updatedAt: FieldValue.serverTimestamp(),
-  }, { merge: true });
+  const accountDocId = String(accountKey);
+  await db.collection(COLLECTIONS.metaApiAccountSnapshots).doc(accountDocId).set(accountSnapshot, { merge: false });
+  await db.collection(COLLECTIONS.accounts).doc(accountDocId).set(
+    {
+      ...persistMeta,
+      metaapi_region: region,
+      last_metaapi_sync_at: nowIso,
+      metaapi_sync_status: deferTradeSync ? 'syncing_trades' : 'success',
+      metaapi_sync_error: null,
+      metaapi_snapshot_version: FieldValue.increment(1),
+      updatedAt: FieldValue.serverTimestamp(),
+    },
+    { merge: true },
+  );
+  logSyncPhase(accountKey, 'metrics persisted', syncStarted);
+
+  const finishSuccess = async (tradeCounts) => {
+    await db.collection(COLLECTIONS.accounts).doc(accountDocId).set(
+      {
+        metaapi_sync_status: 'success',
+        metaapi_sync_error: null,
+        last_metaapi_sync_at: nowIso,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+    logSyncPhase(accountKey, 'complete', syncStarted);
+    return tradeCounts;
+  };
+
+  if (deferTradeSync) {
+    void (async () => {
+      try {
+        const tradeCounts = await syncMetaApiTradeDocuments(
+          account,
+          accountForMetaApi,
+          token,
+          region,
+          accountInfo,
+          syncRunId,
+          nowIso,
+        );
+        await finishSuccess(tradeCounts);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        console.error(`[MetaApi sync][${accountKey}] background trades failed:`, message);
+        await db.collection(COLLECTIONS.accounts).doc(accountDocId).set(
+          {
+            metaapi_sync_status: 'error',
+            metaapi_sync_error: `Metrics saved; trade history sync failed: ${message}`,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+      }
+    })();
+
+    return {
+      accountId: accountKey,
+      syncRunId,
+      tradesSynced: 0,
+      positionsSynced: 0,
+      tradesSync: 'background',
+      requestedBy,
+      syncedAt: nowIso,
+    };
+  }
+
+  const tradeCounts = await syncMetaApiTradeDocuments(
+    account,
+    accountForMetaApi,
+    token,
+    region,
+    accountInfo,
+    syncRunId,
+    nowIso,
+  );
+  await finishSuccess(tradeCounts);
 
   return {
-    accountId: account.id || account.metaapi_account_id,
+    accountId: accountKey,
     syncRunId,
-    tradesSynced: normalizedDeals.length,
-    positionsSynced: normalizedPositions.length,
+    tradesSynced: tradeCounts.tradesSynced,
+    positionsSynced: tradeCounts.positionsSynced,
     requestedBy,
     syncedAt: nowIso,
   };

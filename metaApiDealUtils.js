@@ -63,27 +63,33 @@ function tradeSnapshotNet(trade) {
 }
 
 function metaApiDealToTradeSnapshot(deal) {
+  const t = deal.time != null && deal.time !== '' ? deal.time : null;
   return {
     id: deal.id,
-    symbol: deal.symbol,
+    symbol: deal.symbol || '',
     type: deal.type,
     volume: deal.volume,
     openPrice: deal.price,
     closePrice: deal.price,
     profit: deal.profit,
-    openTime: deal.time,
-    closeTime: deal.time,
+    openTime: t,
+    closeTime: t,
     swap: deal.swap,
     commission: deal.commission,
-    comment: deal.comment,
+    comment: deal.comment == null ? null : deal.comment,
   };
+}
+
+function tradeSortTimeMs(trade) {
+  const raw = trade.closeTime || trade.openTime;
+  if (raw == null || raw === '') return 0;
+  const ms = new Date(raw).getTime();
+  return Number.isFinite(ms) ? ms : 0;
 }
 
 function calculateMetrics(trades, initialBalance) {
   const sortedTrades = [...trades].sort((left, right) => {
-    const leftTime = new Date(left.closeTime || left.openTime).getTime();
-    const rightTime = new Date(right.closeTime || right.openTime).getTime();
-    return leftTime - rightTime;
+    return tradeSortTimeMs(left) - tradeSortTimeMs(right);
   });
 
   let wins = 0;
