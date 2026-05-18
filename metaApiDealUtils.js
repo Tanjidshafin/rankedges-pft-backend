@@ -181,10 +181,61 @@ async function fetchMetaApiHistoryDealsPaginated(
   return Array.from(byId.values());
 }
 
+const FULL_HISTORY_START_ISO = '2000-01-01T00:00:00.000Z';
+
+async function fetchMetaApiHistoryDealsFullRange(clientApiUrl, accountId, authToken, onProgress) {
+  const endIso = new Date().toISOString();
+  return fetchMetaApiHistoryDealsPaginated(
+    clientApiUrl,
+    accountId,
+    authToken,
+    FULL_HISTORY_START_ISO,
+    endIso,
+    onProgress,
+  );
+}
+
+function firestoreTradeDocToSnapshot(data) {
+  return {
+    id: String(data.id || ''),
+    symbol: data.symbol || '',
+    type: data.type,
+    volume: Number(data.volume || 0),
+    openPrice: Number(data.openPrice || 0),
+    closePrice: Number(data.closePrice || 0),
+    profit: Number(data.profit || 0),
+    openTime: data.openTime ?? null,
+    closeTime: data.closeTime ?? null,
+    swap: Number(data.swap || 0),
+    commission: Number(data.commission || 0),
+    comment: data.comment == null ? null : data.comment,
+  };
+}
+
+/**
+ * Derive headline activity metrics from persisted metaApiTrades rows (no MetaApi fetch).
+ * @param {object[]} tradeDocs plain Firestore trade payloads
+ * @param {number} terminalBalance live or MetaStats balance for gain/dd baseline
+ */
+function deriveMetricsFromFirestoreTradeDocs(tradeDocs, terminalBalance) {
+  const normalizedTrades = (Array.isArray(tradeDocs) ? tradeDocs : []).map((row) =>
+    firestoreTradeDocToSnapshot(row),
+  );
+  const initial =
+    Number.isFinite(terminalBalance) && terminalBalance > 0 ? Number(terminalBalance) : Number.EPSILON;
+  const metrics = calculateMetrics(normalizedTrades, initial);
+  return { normalizedTrades, metrics };
+}
+
 module.exports = {
   HISTORY_DEALS_PAGE_LIMIT,
+  FULL_HISTORY_START_ISO,
   fetchMetaApiHistoryDealsPaginated,
+  fetchMetaApiHistoryDealsFullRange,
   filterDealsForMetrics,
   deriveSyncedMetricsPackage,
+  deriveMetricsFromFirestoreTradeDocs,
+  firestoreTradeDocToSnapshot,
+  calculateMetrics,
   metaApiDealToTradeSnapshot,
 };

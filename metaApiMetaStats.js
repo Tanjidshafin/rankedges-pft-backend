@@ -141,10 +141,56 @@ function coerceInt(value) {
   return n;
 }
 
+function resolveTotalTradesFromMetaStats(raw) {
+  const direct = coerceInt(raw.trades);
+  if (direct != null && direct > 0) return direct;
+  const totalTrades = coerceInt(raw.totalTrades);
+  if (totalTrades != null && totalTrades > 0) return totalTrades;
+  const won = coerceInt(raw.wonTrades);
+  const lost = coerceInt(raw.lostTrades);
+  if (won != null && lost != null) return won + lost;
+  if (direct != null) return direct;
+  if (totalTrades != null) return totalTrades;
+  return direct;
+}
+
+/** True when MetaStats reports no closed-trade activity (balance-only snapshot). */
+function isMetaStatsActivityEmpty(mapped) {
+  const trades = mapped.total_trades ?? 0;
+  if (trades > 0) return false;
+  const profit = mapped.profit ?? 0;
+  const gain = mapped.gain ?? 0;
+  const winRate = mapped.win_rate ?? 0;
+  const dd = mapped.dd ?? 0;
+  return profit === 0 && gain === 0 && winRate === 0 && dd === 0;
+}
+
+function mergeActivityMetricsInto(mapped, derived) {
+  if (!derived || typeof derived !== 'object') return mapped;
+  mapped.gain = derived.gain;
+  mapped.dd = derived.dd;
+  mapped.profit = derived.profit;
+  mapped.win_rate = derived.win_rate;
+  mapped.total_trades = derived.total_trades;
+  return mapped;
+}
+
 function mapMetaStatsToAccountMetrics(body) {
   const raw = unwrapMetaStatsMetricsBody(body);
   if (!raw || typeof raw !== 'object') {
     throw new Error('MetaStats metrics payload is missing or invalid');
+  }
+
+  const totalTrades = resolveTotalTradesFromMetaStats(raw);
+  if ((totalTrades ?? 0) === 0) {
+    console.log('[MetaStats][empty-activity-fields]', safeJsonSnippet({
+      trades: raw.trades,
+      totalTrades: raw.totalTrades,
+      wonTrades: raw.wonTrades,
+      lostTrades: raw.lostTrades,
+      profit: raw.profit,
+      gain: raw.gain,
+    }));
   }
 
   const mapped = {
@@ -163,7 +209,7 @@ function mapMetaStatsToAccountMetrics(body) {
     metaapi_deposits: coerceNumber(raw.deposits),
     metaapi_withdrawals: coerceNumber(raw.withdrawals),
     win_rate: percentAlreadyDisplay(raw.wonTradesPercent, 2),
-    total_trades: coerceInt(raw.trades),
+    total_trades: totalTrades,
   };
 
   console.log('[MetaStats][mapped]', safeJsonSnippet(mapped));
@@ -242,6 +288,9 @@ module.exports = {
   slimMetaStatsForStorage,
   resolveMaxDrawdownPercent,
   maxDrawdownToDisplayPercent,
+  resolveTotalTradesFromMetaStats,
+  isMetaStatsActivityEmpty,
+  mergeActivityMetricsInto,
   mapMetaStatsToAccountMetrics,
   fetchMetaStatsMetrics,
 };

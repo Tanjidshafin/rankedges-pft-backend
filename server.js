@@ -6,10 +6,14 @@ const admin = require('firebase-admin');
 const {
   fetchMetaApiHistoryDealsPaginated,
   deriveSyncedMetricsPackage,
+  fetchMetaApiHistoryDealsFullRange,
+  deriveMetricsFromFirestoreTradeDocs,
 } = require('./metaApiDealUtils');
 const {
   fetchMetaStatsMetrics,
   mapMetaStatsToAccountMetrics,
+  isMetaStatsActivityEmpty,
+  mergeActivityMetricsInto,
   safeJsonSnippet,
   slimMetaStatsForStorage,
   MetaStatsFetchError,
@@ -28,6 +32,8 @@ const {
   reportAdminBulkSyncProgressThrottled,
   clearAdminBulkSyncProgress: clearAdminBulkSyncProgressDoc,
 } = require('./syncProgressReporter');
+const { createAchievementEngine, DEFINITION_BY_ID } = require('./achievementEngine');
+const { createNotificationAdmin } = require('./notificationAdmin');
 
 const METAAPI_TRADES_FULL = 'full';
 const METAAPI_TRADES_METRICS_ONLY = 'metrics_only';
@@ -79,10 +85,26 @@ const INTERNAL_CRON_ENABLED = String(process.env.PFT_CRON_ENABLED || 'false').to
 const INTERNAL_CRON_TIMEZONE = process.env.PFT_CRON_TIMEZONE || 'UTC';
 const INTERNAL_CRON_SYNC_SCHEDULE = process.env.PFT_CRON_SYNC_SCHEDULE || '0 0,12 * * *';
 const INTERNAL_CRON_CAPTURE_SCHEDULE = process.env.PFT_CRON_CAPTURE_SCHEDULE || '5 0 * * *';
+const ACHIEVEMENT_CRON_ENABLED =
+  process.env.ACHIEVEMENT_CRON_ENABLED !== undefined
+    ? String(process.env.ACHIEVEMENT_CRON_ENABLED).toLowerCase() === 'true'
+    : INTERNAL_CRON_ENABLED;
+const ACHIEVEMENT_CRON_SCHEDULE = process.env.ACHIEVEMENT_CRON_SCHEDULE || '0 0 * * *';
+const ACHIEVEMENT_CRON_TIMEZONE =
+  process.env.ACHIEVEMENT_CRON_TIMEZONE || INTERNAL_CRON_TIMEZONE;
+const ACHIEVEMENT_CRON_CONCURRENCY = Math.max(
+  1,
+  Math.min(Number(process.env.ACHIEVEMENT_CRON_CONCURRENCY) || 5, 20),
+);
+const ACHIEVEMENT_CRON_PAGE_SIZE = Math.max(
+  50,
+  Math.min(Number(process.env.ACHIEVEMENT_CRON_PAGE_SIZE) || 200, 500),
+);
 
 const schedulerState = {
   syncRunning: false,
   captureRunning: false,
+  achievementCronRunning: false,
 };
 function initializeFirebaseAdmin() {
   if (admin.apps.length > 0) return;
@@ -180,9 +202,34 @@ const COLLECTIONS = {
   metaApiPositions: 'metaApiPositions',
   metaApiSyncRuns: 'metaApiSyncRuns',
   metaApiAdminSyncProgress: 'metaApiAdminSyncProgress',
+  leaderboard: 'leaderboard',
+  prizePayouts: 'prizePayouts',
+  scamAlerts: 'scamAlerts',
+  reviews: 'reviews',
+  contestParticipations: 'contestParticipations',
+  userAchievements: 'userAchievements',
+  notifications: 'notifications',
 };
 
 const ADMIN_SYNC_PROGRESS_DOC_ID = 'current';
+
+const ACHIEVEMENT_ENGINE_COLLECTIONS = {
+  users: COLLECTIONS.users,
+  tradingAccounts: COLLECTIONS.accounts,
+  leaderboard: COLLECTIONS.leaderboard,
+  prizePayouts: COLLECTIONS.prizePayouts,
+  scamAlerts: COLLECTIONS.scamAlerts,
+  reviews: COLLECTIONS.reviews,
+  contestParticipations: COLLECTIONS.contestParticipations,
+  metaApiTrades: COLLECTIONS.metaApiTrades,
+  userAchievements: COLLECTIONS.userAchievements,
+};
+
+const achievementEngine = createAchievementEngine(db, ACHIEVEMENT_ENGINE_COLLECTIONS);
+const notificationAdmin = createNotificationAdmin(db, {
+  users: COLLECTIONS.users,
+  notifications: COLLECTIONS.notifications,
+});
 
 const SETTINGS_DOC_ID = 'site_settings';
 
@@ -533,6 +580,26 @@ async function fetchMetaApiAccountInfo(account, token, region) {
   );
 }
 
+async function loadFirestoreTradesForAccount(userId, accountKey, metaapiCloudAccountId, login) {
+  const candidates = [
+    ...new Set(
+      [accountKey, metaapiCloudAccountId, login].filter((v) => typeof v === 'string' && String(v).trim()),
+    ),
+  ];
+  const byDocId = new Map();
+  for (const accountId of candidates) {
+    const snap = await db
+      .collection(COLLECTIONS.metaApiTrades)
+      .where('user_id', '==', userId)
+      .where('account_id', '==', accountId)
+      .get();
+    for (const docSnap of snap.docs) {
+      byDocId.set(docSnap.id, { id: docSnap.id, ...docSnap.data() });
+    }
+  }
+  return Array.from(byDocId.values());
+}
+
 async function fetchMetaApiTrades(account, token, startTime, endTime, region, onProgress) {
   const resolvedRegion = region || account.metaapi_region || 'new-york';
   const clientApiUrl = getClientApiUrl(resolvedRegion);
@@ -876,6 +943,63 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
     }
     logSyncPhase(accountKey, 'metastats', syncStarted);
 
+    let metricsActivitySource = 'metastats';
+    const platform =
+      account.platform === 'mt4' || account.platform === 'mt5'
+        ? account.platform
+        : accountInfo.platform === 'mt4' || accountInfo.platform === 'mt5'
+          ? accountInfo.platform
+          : 'mt5';
+
+    if (isMetaStatsActivityEmpty(mappedMetrics)) {
+      const terminalBalance =
+        mappedMetrics.balance != null && Number.isFinite(mappedMetrics.balance)
+          ? mappedMetrics.balance
+          : Number(accountInfo.balance || 0);
+
+      await report('metrics_fallback', 'MetaStats reported no activity; checking stored trades…');
+      const tradeDocs = await loadFirestoreTradesForAccount(
+        account.user_id,
+        accountKey,
+        metaapiCloudAccountId,
+        account.login || '',
+      );
+      const fromFirestore = deriveMetricsFromFirestoreTradeDocs(tradeDocs, terminalBalance);
+      if ((fromFirestore.metrics.total_trades ?? 0) > 0) {
+        mergeActivityMetricsInto(mappedMetrics, fromFirestore.metrics);
+        metricsActivitySource = 'firestore_trades';
+        console.log(
+          `[MetaStats][fallback] firestore_trades account=${accountKey} trades=${fromFirestore.metrics.total_trades}`,
+        );
+      } else {
+        await report('metrics_fallback', 'Fetching full deal history from MetaApi…');
+        const clientApiUrl = getClientApiUrl(region);
+        const rawDeals = await fetchMetaApiHistoryDealsFullRange(
+          clientApiUrl,
+          metaapiCloudAccountId,
+          token,
+          ({ loaded }) => {
+            if (loaded > 0 && loaded % 500 === 0) {
+              logSyncPhase(accountKey, `metrics fallback deals loaded=${loaded}`, syncStarted);
+            }
+          },
+        );
+        const { metrics: dealMetrics } = deriveSyncedMetricsPackage(
+          terminalBalance,
+          Array.isArray(rawDeals) ? rawDeals : [],
+          platform,
+        );
+        if ((dealMetrics.total_trades ?? 0) > 0) {
+          mergeActivityMetricsInto(mappedMetrics, dealMetrics);
+          metricsActivitySource = 'metaapi_deals';
+          console.log(
+            `[MetaStats][fallback] metaapi_deals account=${accountKey} trades=${dealMetrics.total_trades}`,
+          );
+        }
+      }
+      logSyncPhase(accountKey, `metrics activity source=${metricsActivitySource}`, syncStarted);
+    }
+
     const nowIso = new Date().toISOString();
     const syncRunId = `${accountKey}-${Date.now()}`;
 
@@ -938,6 +1062,7 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
           ? mappedMetrics.metaapi_withdrawals
           : null,
       metaapi_metrics_synced_at: nowIso,
+      metaapi_metrics_activity_source: metricsActivitySource,
     };
     console.log('[MetaStats][persist]', safeJsonSnippet(persistMeta));
 
@@ -1213,6 +1338,21 @@ function resolveDrawdownAtCapture(metaApiInfo) {
   }
 
   return null;
+}
+
+/** MetaStats-synced drawdown on tradingAccounts (same source as Admin Account Metrics). */
+function resolveDrawdownFromAccountDoc(account) {
+  const dd = Number(account?.dd);
+  if (Number.isFinite(dd)) return dd;
+  return null;
+}
+
+function resolveDrawdownForPftCapture(metaApiInfo, account) {
+  const fromRpc = resolveDrawdownAtCapture(metaApiInfo);
+  if (fromRpc != null) return { drawdown: fromRpc, drawdownSource: 'metaapi_account_information' };
+  const fromDoc = resolveDrawdownFromAccountDoc(account);
+  if (fromDoc != null) return { drawdown: fromDoc, drawdownSource: 'metastats_account_doc' };
+  return { drawdown: null, drawdownSource: null };
 }
 
 function isParticipantRankEligible(status) {
@@ -1581,11 +1721,51 @@ async function captureBatch(batchId, requestedBy, reprocess = false) {
           throw new Error('Invalid starting balance.');
         }
 
-        const metaApiInfo = await getMetaApiAccountInfoWithRetry(account, 3);
-        const finalBalance = Number(metaApiInfo.balance || 0);
-        const finalEquity = Number(metaApiInfo.equity || 0);
-        const gainPercent = Number((((finalEquity - startingBalance) / startingBalance) * 100).toFixed(4));
-        const drawdownAtCapture = resolveDrawdownAtCapture(metaApiInfo);
+        let finalBalance;
+        let finalEquity;
+        let gainPercent;
+        let drawdownAtCapture;
+        let drawdownSource;
+        let rawApiPayload;
+        let captureSource = 'metaapi_rpc';
+
+        try {
+          const metaApiInfo = await getMetaApiAccountInfoWithRetry(account, 3);
+          finalBalance = Number(metaApiInfo.balance || 0);
+          finalEquity = Number(metaApiInfo.equity || 0);
+          gainPercent = Number((((finalEquity - startingBalance) / startingBalance) * 100).toFixed(4));
+          const ddResolved = resolveDrawdownForPftCapture(metaApiInfo, account);
+          drawdownAtCapture = ddResolved.drawdown;
+          drawdownSource = ddResolved.drawdownSource;
+          rawApiPayload = {
+            accountInformation: metaApiInfo,
+            drawdownSource,
+          };
+        } catch (rpcError) {
+          const docBalance = Number(account.balance ?? 0);
+          const docEquity = Number(account.equity ?? docBalance);
+          if (!Number.isFinite(docBalance) || docBalance <= 0) {
+            throw rpcError;
+          }
+          console.warn(
+            `[PFT capture] MetaApi RPC failed for account ${participant.accountId}; using tradingAccounts doc fallback:`,
+            rpcError instanceof Error ? rpcError.message : rpcError,
+          );
+          finalBalance = docBalance;
+          finalEquity = docEquity;
+          gainPercent = Number((((docEquity - startingBalance) / startingBalance) * 100).toFixed(4));
+          const ddResolved = resolveDrawdownForPftCapture(null, account);
+          drawdownAtCapture = ddResolved.drawdown;
+          drawdownSource = ddResolved.drawdownSource || 'account_doc_fallback';
+          rawApiPayload = {
+            fallback: true,
+            captureSource: 'account_doc_fallback',
+            drawdownSource,
+            metaapi_metrics_synced_at: account.metaapi_metrics_synced_at || null,
+            rpcError: rpcError instanceof Error ? rpcError.message : String(rpcError),
+          };
+          captureSource = 'account_doc_fallback';
+        }
 
         await db.collection(COLLECTIONS.snapshots).add({
           ...snapshotBase,
@@ -1596,8 +1776,10 @@ async function captureBatch(batchId, requestedBy, reprocess = false) {
           finalEquity,
           gainPercent,
           drawdownAtCapture,
+          drawdownSource: drawdownSource || null,
+          captureSource,
           status: 'completed',
-          rawApiPayload: metaApiInfo,
+          rawApiPayload,
         });
 
         await db.collection(COLLECTIONS.participants).doc(participant.id).set({
@@ -1667,6 +1849,20 @@ async function captureBatch(batchId, requestedBy, reprocess = false) {
     }, { merge: true });
     throw error;
   }
+}
+
+async function pftBatchNumberExists(batchNumber, programId = 'default') {
+  const normalized = Number(batchNumber);
+  if (!Number.isFinite(normalized)) return false;
+
+  const snap = await db
+    .collection(COLLECTIONS.batches)
+    .where('batchNumber', '==', normalized)
+    .where('programId', '==', programId)
+    .limit(1)
+    .get();
+
+  return !snap.empty;
 }
 
 async function syncProgramBatchesInternal(requestedBy = 'cron') {
@@ -1905,13 +2101,26 @@ app.post('/api/pft/program/ensure', requireAdmin, async (req, res) => {
 app.post('/api/pft/batches', requireAdmin, async (req, res) => {
   try {
     const { batchNumber, startAt, endAt, programId = 'default' } = req.body || {};
-    if (!batchNumber || !startAt || !endAt) {
+    if (batchNumber === undefined || batchNumber === null || batchNumber === '' || !startAt || !endAt) {
       res.status(400).json({ error: 'batchNumber, startAt, and endAt are required.' });
       return;
     }
 
+    const normalizedBatchNumber = Number(batchNumber);
+    if (!Number.isInteger(normalizedBatchNumber) || normalizedBatchNumber < 1) {
+      res.status(400).json({ error: 'batchNumber must be a positive whole number.' });
+      return;
+    }
+
+    if (await pftBatchNumberExists(normalizedBatchNumber, programId)) {
+      res.status(409).json({
+        error: `PFT batch number ${normalizedBatchNumber} already exists. Each batch number must be unique.`,
+      });
+      return;
+    }
+
     const ref = await db.collection(COLLECTIONS.batches).add({
-      batchNumber: Number(batchNumber),
+      batchNumber: normalizedBatchNumber,
       startAt,
       endAt,
       programId,
@@ -2195,6 +2404,90 @@ app.post('/api/pft/cron/capture-ended', requireCronSecret, async (_req, res) => 
   }
 });
 
+async function processAchievementUser(userId) {
+  const { newlyUnlocked } = await achievementEngine.checkAndAwardAchievementsForUser(userId);
+  let notificationsSent = 0;
+
+  for (const id of newlyUnlocked) {
+    const def = DEFINITION_BY_ID.get(id);
+    if (!def) continue;
+    const notificationId = await notificationAdmin.createNotification({
+      userId,
+      type: 'achievement_unlocked',
+      title: `Achievement Unlocked: ${def.title}`,
+      message: def.description,
+      link: '/profile',
+    });
+    if (notificationId) notificationsSent += 1;
+  }
+
+  return { awardsGranted: newlyUnlocked.length, notificationsSent };
+}
+
+async function runAchievementCronInternal(requestedBy = 'cron') {
+  const summary = {
+    requestedBy,
+    usersProcessed: 0,
+    awardsGranted: 0,
+    notificationsSent: 0,
+    errors: 0,
+  };
+
+  let lastDoc = null;
+  const pageSize = ACHIEVEMENT_CRON_PAGE_SIZE;
+
+  while (true) {
+    let pageQuery = db
+      .collection(COLLECTIONS.users)
+      .orderBy(admin.firestore.FieldPath.documentId())
+      .limit(pageSize);
+    if (lastDoc) {
+      pageQuery = pageQuery.startAfter(lastDoc);
+    }
+
+    const pageSnap = await pageQuery.get();
+    if (pageSnap.empty) break;
+
+    const userIds = pageSnap.docs.map((docSnap) => docSnap.id);
+
+    for (let i = 0; i < userIds.length; i += ACHIEVEMENT_CRON_CONCURRENCY) {
+      const chunk = userIds.slice(i, i + ACHIEVEMENT_CRON_CONCURRENCY);
+      await Promise.all(
+        chunk.map(async (userId) => {
+          try {
+            const result = await processAchievementUser(userId);
+            summary.usersProcessed += 1;
+            summary.awardsGranted += result.awardsGranted;
+            summary.notificationsSent += result.notificationsSent;
+          } catch (error) {
+            summary.errors += 1;
+            console.error(
+              `[achievement-cron] user ${userId}:`,
+              error instanceof Error ? error.message : error,
+            );
+          }
+        }),
+      );
+    }
+
+    lastDoc = pageSnap.docs[pageSnap.docs.length - 1];
+    if (pageSnap.size < pageSize) break;
+  }
+
+  return summary;
+}
+
+app.post('/api/cron/check-achievements', requireCronSecret, async (_req, res) => {
+  try {
+    const result = await runAchievementCronInternal('http');
+    res.json({ ok: true, ...result });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to run achievement cron.',
+    });
+  }
+});
+
 function wrapCronTask(taskName, lockKey, handler) {
   return async () => {
     if (schedulerState[lockKey]) {
@@ -2217,36 +2510,58 @@ function wrapCronTask(taskName, lockKey, handler) {
   };
 }
 
-function startInternalCronScheduler() {
-  if (!INTERNAL_CRON_ENABLED) {
-    console.log('Internal scheduler disabled. Set PFT_CRON_ENABLED=true to enable.');
+function startAchievementCronScheduler() {
+  if (!ACHIEVEMENT_CRON_ENABLED) {
+    console.log('Achievement cron disabled. Set ACHIEVEMENT_CRON_ENABLED=true to enable.');
     return;
   }
 
-  if (!cron.validate(INTERNAL_CRON_SYNC_SCHEDULE)) {
-    console.error(`Invalid sync schedule expression: ${INTERNAL_CRON_SYNC_SCHEDULE}`);
-    return;
-  }
-  if (!cron.validate(INTERNAL_CRON_CAPTURE_SCHEDULE)) {
-    console.error(`Invalid capture schedule expression: ${INTERNAL_CRON_CAPTURE_SCHEDULE}`);
+  if (!cron.validate(ACHIEVEMENT_CRON_SCHEDULE)) {
+    console.error(`Invalid achievement cron schedule: ${ACHIEVEMENT_CRON_SCHEDULE}`);
     return;
   }
 
   cron.schedule(
-    INTERNAL_CRON_SYNC_SCHEDULE,
-    wrapCronTask('sync-metaapi', 'syncRunning', () => syncAllMetaApiAccountsInternal('scheduled')),
-    { timezone: INTERNAL_CRON_TIMEZONE },
-  );
-
-  cron.schedule(
-    INTERNAL_CRON_CAPTURE_SCHEDULE,
-    wrapCronTask('capture-ended', 'captureRunning', () => captureEndedBatchesInternal('scheduled')),
-    { timezone: INTERNAL_CRON_TIMEZONE },
+    ACHIEVEMENT_CRON_SCHEDULE,
+    wrapCronTask('check-achievements', 'achievementCronRunning', () =>
+      runAchievementCronInternal('scheduled'),
+    ),
+    { timezone: ACHIEVEMENT_CRON_TIMEZONE },
   );
 
   console.log(
-    `Internal scheduler enabled (timezone=${INTERNAL_CRON_TIMEZONE}, sync='${INTERNAL_CRON_SYNC_SCHEDULE}', capture='${INTERNAL_CRON_CAPTURE_SCHEDULE}').`,
+    `Achievement cron enabled (timezone=${ACHIEVEMENT_CRON_TIMEZONE}, schedule='${ACHIEVEMENT_CRON_SCHEDULE}', concurrency=${ACHIEVEMENT_CRON_CONCURRENCY}).`,
   );
+}
+
+function startInternalCronScheduler() {
+  if (INTERNAL_CRON_ENABLED) {
+    if (!cron.validate(INTERNAL_CRON_SYNC_SCHEDULE)) {
+      console.error(`Invalid sync schedule expression: ${INTERNAL_CRON_SYNC_SCHEDULE}`);
+    } else if (!cron.validate(INTERNAL_CRON_CAPTURE_SCHEDULE)) {
+      console.error(`Invalid capture schedule expression: ${INTERNAL_CRON_CAPTURE_SCHEDULE}`);
+    } else {
+      cron.schedule(
+        INTERNAL_CRON_SYNC_SCHEDULE,
+        wrapCronTask('sync-metaapi', 'syncRunning', () => syncAllMetaApiAccountsInternal('scheduled')),
+        { timezone: INTERNAL_CRON_TIMEZONE },
+      );
+
+      cron.schedule(
+        INTERNAL_CRON_CAPTURE_SCHEDULE,
+        wrapCronTask('capture-ended', 'captureRunning', () => captureEndedBatchesInternal('scheduled')),
+        { timezone: INTERNAL_CRON_TIMEZONE },
+      );
+
+      console.log(
+        `PFT internal scheduler enabled (timezone=${INTERNAL_CRON_TIMEZONE}, sync='${INTERNAL_CRON_SYNC_SCHEDULE}', capture='${INTERNAL_CRON_CAPTURE_SCHEDULE}').`,
+      );
+    }
+  } else {
+    console.log('PFT internal scheduler disabled. Set PFT_CRON_ENABLED=true to enable.');
+  }
+
+  startAchievementCronScheduler();
 }
 
 app.listen(PORT, () => {
