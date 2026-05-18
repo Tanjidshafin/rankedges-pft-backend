@@ -21,6 +21,45 @@ const {
 } = require('./metaApiProvisioningFeatures');
 const { formatMetaApiHttpError } = require('./metaApiHttpErrors');
 const { assertMetaApiCloudAccountId } = require('./metaApiProvisioningId');
+const {
+  reportAccountSyncProgressThrottled,
+  flushAccountThrottleNow,
+  forgetAccountThrottleState,
+  reportAdminBulkSyncProgressThrottled,
+  clearAdminBulkSyncProgress: clearAdminBulkSyncProgressDoc,
+} = require('./syncProgressReporter');
+
+const METAAPI_TRADES_FULL = 'full';
+const METAAPI_TRADES_METRICS_ONLY = 'metrics_only';
+
+function normalizeTradesMode(value) {
+  const v = String(value || '').toLowerCase();
+  if (v === METAAPI_TRADES_METRICS_ONLY) return METAAPI_TRADES_METRICS_ONLY;
+  return METAAPI_TRADES_FULL;
+}
+
+/** Per-request/run trades persistence (documents in metaApiTrades/metaApiPositions). */
+function resolveTradesMode(requestedBy, options = {}) {
+  if (options.tradesMode) return normalizeTradesMode(options.tradesMode);
+
+  const allRaw = process.env.METAAPI_SYNC_ALL_TRADES_MODE;
+  const bulkAllExplicit =
+    allRaw !== undefined && String(allRaw).trim() !== ''
+      ? normalizeTradesMode(allRaw)
+      : undefined;
+
+  if (requestedBy === 'admin_manual' && options.bulkSyncAll === true) {
+    if (bulkAllExplicit === METAAPI_TRADES_FULL || bulkAllExplicit === METAAPI_TRADES_METRICS_ONLY) return bulkAllExplicit;
+    return METAAPI_TRADES_METRICS_ONLY;
+  }
+
+  if (requestedBy === 'admin_manual' && options.bulkSyncAll !== true) {
+    return METAAPI_TRADES_FULL;
+  }
+
+  const global = normalizeTradesMode(process.env.METAAPI_SYNC_TRADES_MODE || METAAPI_TRADES_FULL);
+  return global === METAAPI_TRADES_METRICS_ONLY ? METAAPI_TRADES_METRICS_ONLY : METAAPI_TRADES_FULL;
+}
 const app = express();
 const PORT = Number(process.env.PORT || 3001);
 const DEFAULT_TOP_200_SIZE = 200;
@@ -309,23 +348,37 @@ async function deleteDocumentsByField(collectionName, fieldName, fieldValue) {
   return deleted;
 }
 
-async function commitFirestoreWriteChunk(collectionName, chunk) {
-  const batch = db.batch();
-  chunk.forEach(({ id, data }) => {
-    const payload = omitUndefinedFirestoreFields(data);
-    batch.set(db.collection(collectionName).doc(id), payload, { merge: false });
-  });
-  await batch.commit();
-}
-
 async function writeDocuments(collectionName, docs) {
   if (docs.length === 0) return;
-  const chunks = chunkArray(docs, 400);
-  const concurrency = Math.max(1, Math.min(8, Number(process.env.FIRESTORE_WRITE_CONCURRENCY || 4)));
-  for (let index = 0; index < chunks.length; index += concurrency) {
-    await Promise.all(
-      chunks.slice(index, index + concurrency).map((chunk) => commitFirestoreWriteChunk(collectionName, chunk)),
+  const maxPerSec = Math.max(10, Number(process.env.FIRESTORE_MAX_WRITES_PER_SEC || 200));
+
+  const bulkWriter = db.bulkWriter({
+    throttling: {
+      initialOpsPerSecond: maxPerSec,
+      maxOpsPerSecond: maxPerSec,
+    },
+  });
+
+  bulkWriter.onWriteError((error) => {
+    console.warn(
+      '[Firestore][BulkWriter]',
+      error.code,
+      error.message,
+      'attempt',
+      error.failedAttempts,
     );
+    return Number(error.failedAttempts || 0) < 15;
+  });
+
+  const colRef = db.collection(collectionName);
+  try {
+    for (const doc of docs) {
+      bulkWriter.set(colRef.doc(String(doc.id)), omitUndefinedFirestoreFields(doc.data), { merge: false });
+    }
+    await bulkWriter.close();
+  } catch (error) {
+    console.error('[Firestore][BulkWriter] fatal:', error instanceof Error ? error.message : error);
+    throw error;
   }
 }
 
@@ -569,66 +622,8 @@ function logSyncPhase(accountKey, label, startedMs) {
   console.log(`[MetaApi sync][${accountKey}] ${label} ${Date.now() - startedMs}ms`);
 }
 
-async function reportAccountSyncProgress(accountDocId, phase, message, extra = {}) {
-  if (!accountDocId) return;
-  try {
-    await db.collection(COLLECTIONS.accounts).doc(String(accountDocId)).set(
-      {
-        metaapi_sync_progress: {
-          phase,
-          message,
-          updatedAt: new Date().toISOString(),
-          ...extra,
-        },
-      },
-      { merge: true },
-    );
-  } catch (err) {
-    console.warn('[MetaApi sync] progress write failed:', err instanceof Error ? err.message : err);
-  }
-}
-
-async function clearAccountSyncProgress(accountDocId) {
-  if (!accountDocId) return;
-  try {
-    await db.collection(COLLECTIONS.accounts).doc(String(accountDocId)).set(
-      { metaapi_sync_progress: null },
-      { merge: true },
-    );
-  } catch (_) {
-    /* empty */
-  }
-}
-
-async function reportAdminBulkSyncProgress(payload) {
-  try {
-    await db.collection(COLLECTIONS.metaApiAdminSyncProgress).doc(ADMIN_SYNC_PROGRESS_DOC_ID).set(
-      {
-        active: true,
-        updatedAt: new Date().toISOString(),
-        ...payload,
-      },
-      { merge: true },
-    );
-  } catch (err) {
-    console.warn('[MetaApi sync] bulk progress write failed:', err instanceof Error ? err.message : err);
-  }
-}
-
 async function clearAdminBulkSyncProgress() {
-  try {
-    await db.collection(COLLECTIONS.metaApiAdminSyncProgress).doc(ADMIN_SYNC_PROGRESS_DOC_ID).set(
-      {
-        active: false,
-        message: 'Idle',
-        phase: 'idle',
-        updatedAt: new Date().toISOString(),
-      },
-      { merge: true },
-    );
-  } catch (_) {
-    /* empty */
-  }
+  return clearAdminBulkSyncProgressDoc(db, COLLECTIONS, ADMIN_SYNC_PROGRESS_DOC_ID);
 }
 
 async function syncMetaApiTradeDocuments(
@@ -648,7 +643,15 @@ async function syncMetaApiTradeDocuments(
     if (progressCtx?.report) {
       await progressCtx.report(phase, message, extra);
     } else {
-      await reportAccountSyncProgress(accountDocId, phase, message, extra);
+      await reportAccountSyncProgressThrottled(
+        db,
+        COLLECTIONS,
+        accountDocId,
+        phase,
+        message,
+        extra,
+        omitUndefinedFirestoreFields,
+      );
     }
   };
 
@@ -666,9 +669,9 @@ async function syncMetaApiTradeDocuments(
     undefined,
     undefined,
     region,
-    async ({ loaded, pageRows }) => {
+    ({ loaded, pageRows }) => {
       if (pageRows > 0) {
-        await report('fetch_deals', `Fetching trade history… (${loaded} deals loaded)`, { dealsLoaded: loaded });
+        logSyncPhase(accountKey, `deals paging (no Firestore) loaded=${loaded}`, phaseStart);
       }
     },
   );
@@ -758,17 +761,27 @@ function shouldDeferTradeSync(requestedBy, options = {}) {
   return requestedBy === 'admin_ui' || requestedBy === 'user_ui';
 }
 
+/** Account-doc progress phases that bypass Firestore-rate throttling (or are required during bulk Sync All). */
+const IMMEDIATE_ACCOUNT_SYNC_PROGRESS_PHASES = new Set(['starting', 'error', 'syncing_trades', 'skipped_trades']);
+
 async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', options = {}) {
   const deferTradeSync = shouldDeferTradeSync(requestedBy, options);
+  const tradesMode = resolveTradesMode(requestedBy, options);
   const accountKey = account.id || account.metaapi_account_id;
   const accountDocId = String(accountKey);
   const syncStarted = Date.now();
   const bulk = options.bulkProgress || null;
 
+  const mergedProgressMessage = (message) =>
+    bulk && bulk.total > 1
+      ? `Account ${bulk.index}/${bulk.total} (#${account.login || accountDocId}): ${message}`
+      : message;
+
   const report = async (phase, message, extra = {}) => {
-    await reportAccountSyncProgress(accountDocId, phase, message, extra);
+    const mergedMsg = mergedProgressMessage(message);
+
     if (bulk) {
-      await reportAdminBulkSyncProgress({
+      await reportAdminBulkSyncProgressThrottled(db, COLLECTIONS, ADMIN_SYNC_PROGRESS_DOC_ID, {
         active: true,
         mode: 'all',
         index: bulk.index,
@@ -776,236 +789,305 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
         currentAccountId: accountDocId,
         currentLogin: account.login || '',
         phase,
-        message: bulk.total > 1 ? `Account ${bulk.index}/${bulk.total} (#${account.login || accountDocId}): ${message}` : message,
+        message: mergedMsg,
         ...extra,
       });
+      if (!IMMEDIATE_ACCOUNT_SYNC_PROGRESS_PHASES.has(phase)) return;
     }
+
+    const progressiveWrite = IMMEDIATE_ACCOUNT_SYNC_PROGRESS_PHASES.has(phase)
+      ? flushAccountThrottleNow
+      : reportAccountSyncProgressThrottled;
+
+    await progressiveWrite(
+      db,
+      COLLECTIONS,
+      accountDocId,
+      phase,
+      mergedMsg,
+      extra,
+      omitUndefinedFirestoreFields,
+    );
   };
 
   const progressCtx = { report };
 
-  try {
-  await report('starting', 'Starting MetaApi sync…');
-
-  const settings = await getSiteSettings();
-  const tokenCandidates = resolveMetaApiTokenCandidates(account, settings);
-  if (!account.metaapi_account_id || tokenCandidates.length === 0) {
-    throw new Error(`MetaApi credentials missing for account ${account.login || accountKey}.`);
-  }
-
-  const metaapiCloudAccountId = assertMetaApiCloudAccountId(account.metaapi_account_id, account.login);
-  const accountForMetaApi = { ...account, metaapi_account_id: metaapiCloudAccountId };
-
-  await report('provisioning', 'Fetching MetaApi account details…');
-  const { token, data: regionPayload } = await requestMetaApiAccountDetailsWithTokens(
-    metaapiCloudAccountId,
-    tokenCandidates,
-  );
-  assertProvisioningReadyForClientApi(regionPayload, metaapiCloudAccountId);
-  const region = resolveMetaApiHostedRegion(regionPayload, accountForMetaApi);
-
-  await report('account_info', 'Fetching live balance and equity…');
-  const accountInfo = await fetchMetaApiAccountInfo(accountForMetaApi, token, region);
-  logSyncPhase(accountKey, 'account info', syncStarted);
-
-  await report('metastats', 'Fetching MetaStats metrics…');
-  const metaStatsRaw = await fetchMetaStatsWithProvisioningRecovery(metaapiCloudAccountId, token, region);
-  let mappedMetrics;
-  try {
-    mappedMetrics = mapMetaStatsToAccountMetrics(metaStatsRaw);
-  } catch (err) {
-    throw new Error(
-      `MetaStats metrics mapping failed for ${account.login || metaapiCloudAccountId}: ${err instanceof Error ? err.message : String(err)}`,
+  const persistTradeSyncErrorOnAccountDoc = async (tradeErrorMessage) => {
+    forgetAccountThrottleState(accountDocId);
+    await db.collection(COLLECTIONS.accounts).doc(accountDocId).set(
+      omitUndefinedFirestoreFields({
+        metaapi_sync_status: 'error',
+        metaapi_sync_error: `Metrics saved; trade history sync failed: ${tradeErrorMessage}`,
+        metaapi_sync_progress: {
+          phase: 'error',
+          message: tradeErrorMessage,
+          updatedAt: new Date().toISOString(),
+        },
+        updatedAt: FieldValue.serverTimestamp(),
+      }),
+      { merge: true },
     );
-  }
-  logSyncPhase(accountKey, 'metastats', syncStarted);
-
-  const nowIso = new Date().toISOString();
-  const syncRunId = `${accountKey}-${Date.now()}`;
-
-  const headlineBalance =
-    mappedMetrics.balance != null && Number.isFinite(mappedMetrics.balance)
-      ? mappedMetrics.balance
-      : Number(accountInfo.balance || 0);
-  const headlineEquity =
-    mappedMetrics.equity != null && Number.isFinite(mappedMetrics.equity)
-      ? mappedMetrics.equity
-      : Number(accountInfo.equity || 0);
-  const headlineGain = mappedMetrics.gain != null && Number.isFinite(mappedMetrics.gain) ? mappedMetrics.gain : 0;
-  const headlineDd = mappedMetrics.dd != null && Number.isFinite(mappedMetrics.dd) ? mappedMetrics.dd : 0;
-  const headlineProfit =
-    mappedMetrics.profit != null && Number.isFinite(mappedMetrics.profit) ? mappedMetrics.profit : 0;
-  const headlineWin =
-    mappedMetrics.win_rate != null && Number.isFinite(mappedMetrics.win_rate) ? mappedMetrics.win_rate : 0;
-  const headlineTotalTrades =
-    mappedMetrics.total_trades != null && Number.isFinite(mappedMetrics.total_trades)
-      ? mappedMetrics.total_trades
-      : 0;
-
-  const persistMeta = {
-    balance: headlineBalance,
-    equity: headlineEquity,
-    gain: headlineGain,
-    dd: headlineDd,
-    profit: headlineProfit,
-    win_rate: headlineWin,
-    total_trades: headlineTotalTrades,
-    metaapi_abs_gain:
-      mappedMetrics.metaapi_abs_gain != null && Number.isFinite(mappedMetrics.metaapi_abs_gain)
-        ? mappedMetrics.metaapi_abs_gain
-        : null,
-    metaapi_daily_gain:
-      mappedMetrics.metaapi_daily_gain != null && Number.isFinite(mappedMetrics.metaapi_daily_gain)
-        ? mappedMetrics.metaapi_daily_gain
-        : null,
-    metaapi_monthly_gain:
-      mappedMetrics.metaapi_monthly_gain != null && Number.isFinite(mappedMetrics.metaapi_monthly_gain)
-        ? mappedMetrics.metaapi_monthly_gain
-        : null,
-    metaapi_highest_balance:
-      mappedMetrics.metaapi_highest_balance != null &&
-      Number.isFinite(mappedMetrics.metaapi_highest_balance)
-        ? mappedMetrics.metaapi_highest_balance
-        : null,
-    metaapi_highest_balance_date: mappedMetrics.metaapi_highest_balance_date ?? null,
-    metaapi_interest:
-      mappedMetrics.metaapi_interest != null && Number.isFinite(mappedMetrics.metaapi_interest)
-        ? mappedMetrics.metaapi_interest
-        : null,
-    metaapi_deposits:
-      mappedMetrics.metaapi_deposits != null && Number.isFinite(mappedMetrics.metaapi_deposits)
-        ? mappedMetrics.metaapi_deposits
-        : null,
-    metaapi_withdrawals:
-      mappedMetrics.metaapi_withdrawals != null &&
-      Number.isFinite(mappedMetrics.metaapi_withdrawals)
-        ? mappedMetrics.metaapi_withdrawals
-        : null,
-    metaapi_metrics_synced_at: nowIso,
-  };
-  console.log('[MetaStats][persist]', safeJsonSnippet(persistMeta));
-
-  const accountSnapshot = {
-    user_id: account.user_id,
-    account_id: account.id || account.metaapi_account_id,
-    account_login: account.login || '',
-    broker_name: account.broker_name || '',
-    balance: Number(accountInfo.balance || 0),
-    equity: Number(accountInfo.equity || 0),
-    margin: Number(accountInfo.margin || 0),
-    freeMargin: Number(accountInfo.freeMargin || 0),
-    leverage: Number(accountInfo.leverage || 0),
-    currency: String(accountInfo.currency || ''),
-    server: String(accountInfo.server || ''),
-    broker: String(accountInfo.broker || ''),
-    raw: accountInfo,
-    meta_stats_metrics_raw: slimMetaStatsForStorage(metaStatsRaw),
-    meta_stats_metrics_mapped: mappedMetrics,
-    metaapi_account_id: account.metaapi_account_id,
-    metaapi_region: region,
-    synced_at: nowIso,
-    sync_run_id: syncRunId,
-    createdAt: FieldValue.serverTimestamp(),
   };
 
-  await report('persist_metrics', 'Saving metrics to database…');
-  await db.collection(COLLECTIONS.metaApiAccountSnapshots).doc(accountDocId).set(accountSnapshot, { merge: false });
-  await db.collection(COLLECTIONS.accounts).doc(accountDocId).set(
-    {
-      ...persistMeta,
+  try {
+    await report('starting', 'Starting MetaApi sync…');
+
+    const settings = await getSiteSettings();
+    const tokenCandidates = resolveMetaApiTokenCandidates(account, settings);
+    if (!account.metaapi_account_id || tokenCandidates.length === 0) {
+      throw new Error(`MetaApi credentials missing for account ${account.login || accountKey}.`);
+    }
+
+    const metaapiCloudAccountId = assertMetaApiCloudAccountId(account.metaapi_account_id, account.login);
+    const accountForMetaApi = { ...account, metaapi_account_id: metaapiCloudAccountId };
+
+    await report('provisioning', 'Fetching MetaApi account details…');
+    const { token, data: regionPayload } = await requestMetaApiAccountDetailsWithTokens(
+      metaapiCloudAccountId,
+      tokenCandidates,
+    );
+    assertProvisioningReadyForClientApi(regionPayload, metaapiCloudAccountId);
+    const region = resolveMetaApiHostedRegion(regionPayload, accountForMetaApi);
+
+    await report('account_info', 'Fetching live balance and equity…');
+    const accountInfo = await fetchMetaApiAccountInfo(accountForMetaApi, token, region);
+    logSyncPhase(accountKey, 'account info', syncStarted);
+
+    await report('metastats', 'Fetching MetaStats metrics…');
+    const metaStatsRaw = await fetchMetaStatsWithProvisioningRecovery(metaapiCloudAccountId, token, region);
+    let mappedMetrics;
+    try {
+      mappedMetrics = mapMetaStatsToAccountMetrics(metaStatsRaw);
+    } catch (err) {
+      throw new Error(
+        `MetaStats metrics mapping failed for ${account.login || metaapiCloudAccountId}: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+    logSyncPhase(accountKey, 'metastats', syncStarted);
+
+    const nowIso = new Date().toISOString();
+    const syncRunId = `${accountKey}-${Date.now()}`;
+
+    const headlineBalance =
+      mappedMetrics.balance != null && Number.isFinite(mappedMetrics.balance)
+        ? mappedMetrics.balance
+        : Number(accountInfo.balance || 0);
+    const headlineEquity =
+      mappedMetrics.equity != null && Number.isFinite(mappedMetrics.equity)
+        ? mappedMetrics.equity
+        : Number(accountInfo.equity || 0);
+    const headlineGain = mappedMetrics.gain != null && Number.isFinite(mappedMetrics.gain) ? mappedMetrics.gain : 0;
+    const headlineDd = mappedMetrics.dd != null && Number.isFinite(mappedMetrics.dd) ? mappedMetrics.dd : 0;
+    const headlineProfit =
+      mappedMetrics.profit != null && Number.isFinite(mappedMetrics.profit) ? mappedMetrics.profit : 0;
+    const headlineWin =
+      mappedMetrics.win_rate != null && Number.isFinite(mappedMetrics.win_rate) ? mappedMetrics.win_rate : 0;
+    const headlineTotalTrades =
+      mappedMetrics.total_trades != null && Number.isFinite(mappedMetrics.total_trades)
+        ? mappedMetrics.total_trades
+        : 0;
+
+    const persistMeta = {
+      balance: headlineBalance,
+      equity: headlineEquity,
+      gain: headlineGain,
+      dd: headlineDd,
+      profit: headlineProfit,
+      win_rate: headlineWin,
+      total_trades: headlineTotalTrades,
+      metaapi_abs_gain:
+        mappedMetrics.metaapi_abs_gain != null && Number.isFinite(mappedMetrics.metaapi_abs_gain)
+          ? mappedMetrics.metaapi_abs_gain
+          : null,
+      metaapi_daily_gain:
+        mappedMetrics.metaapi_daily_gain != null && Number.isFinite(mappedMetrics.metaapi_daily_gain)
+          ? mappedMetrics.metaapi_daily_gain
+          : null,
+      metaapi_monthly_gain:
+        mappedMetrics.metaapi_monthly_gain != null && Number.isFinite(mappedMetrics.metaapi_monthly_gain)
+          ? mappedMetrics.metaapi_monthly_gain
+          : null,
+      metaapi_highest_balance:
+        mappedMetrics.metaapi_highest_balance != null &&
+        Number.isFinite(mappedMetrics.metaapi_highest_balance)
+          ? mappedMetrics.metaapi_highest_balance
+        : null,
+      metaapi_highest_balance_date: mappedMetrics.metaapi_highest_balance_date ?? null,
+      metaapi_interest:
+        mappedMetrics.metaapi_interest != null && Number.isFinite(mappedMetrics.metaapi_interest)
+          ? mappedMetrics.metaapi_interest
+          : null,
+      metaapi_deposits:
+        mappedMetrics.metaapi_deposits != null && Number.isFinite(mappedMetrics.metaapi_deposits)
+          ? mappedMetrics.metaapi_deposits
+          : null,
+      metaapi_withdrawals:
+        mappedMetrics.metaapi_withdrawals != null &&
+        Number.isFinite(mappedMetrics.metaapi_withdrawals)
+          ? mappedMetrics.metaapi_withdrawals
+          : null,
+      metaapi_metrics_synced_at: nowIso,
+    };
+    console.log('[MetaStats][persist]', safeJsonSnippet(persistMeta));
+
+    const accountSnapshot = {
+      user_id: account.user_id,
+      account_id: account.id || account.metaapi_account_id,
+      account_login: account.login || '',
+      broker_name: account.broker_name || '',
+      balance: Number(accountInfo.balance || 0),
+      equity: Number(accountInfo.equity || 0),
+      margin: Number(accountInfo.margin || 0),
+      freeMargin: Number(accountInfo.freeMargin || 0),
+      leverage: Number(accountInfo.leverage || 0),
+      currency: String(accountInfo.currency || ''),
+      server: String(accountInfo.server || ''),
+      broker: String(accountInfo.broker || ''),
+      raw: accountInfo,
+      meta_stats_metrics_raw: slimMetaStatsForStorage(metaStatsRaw),
+      meta_stats_metrics_mapped: mappedMetrics,
+      metaapi_account_id: account.metaapi_account_id,
       metaapi_region: region,
-      last_metaapi_sync_at: nowIso,
-      metaapi_sync_status: deferTradeSync ? 'syncing_trades' : 'success',
-      metaapi_sync_error: null,
-      metaapi_snapshot_version: FieldValue.increment(1),
-      updatedAt: FieldValue.serverTimestamp(),
-    },
-    { merge: true },
-  );
-  logSyncPhase(accountKey, 'metrics persisted', syncStarted);
+      synced_at: nowIso,
+      sync_run_id: syncRunId,
+      createdAt: FieldValue.serverTimestamp(),
+    };
 
-  const finishSuccess = async (tradeCounts) => {
-    await report('complete', 'Sync complete.', {
-      tradesSynced: tradeCounts.tradesSynced,
-      positionsSynced: tradeCounts.positionsSynced,
-    });
+    await report('persist_metrics', 'Saving metrics to database…');
+    await db.collection(COLLECTIONS.metaApiAccountSnapshots).doc(accountDocId).set(accountSnapshot, { merge: false });
+
+    const statusAfterMetrics =
+      deferTradeSync && tradesMode !== METAAPI_TRADES_METRICS_ONLY ? 'syncing_trades' : 'success';
+
     await db.collection(COLLECTIONS.accounts).doc(accountDocId).set(
       {
-        metaapi_sync_status: 'success',
-        metaapi_sync_error: null,
+        ...persistMeta,
+        metaapi_region: region,
         last_metaapi_sync_at: nowIso,
+        metaapi_sync_status: statusAfterMetrics,
+        metaapi_sync_error: null,
+        metaapi_snapshot_version: FieldValue.increment(1),
         updatedAt: FieldValue.serverTimestamp(),
       },
       { merge: true },
     );
-    await clearAccountSyncProgress(accountDocId);
-    logSyncPhase(accountKey, 'complete', syncStarted);
-    return tradeCounts;
-  };
+    logSyncPhase(accountKey, 'metrics persisted', syncStarted);
 
-  if (deferTradeSync) {
-    await report('syncing_trades', 'Metrics saved. Syncing trade history in background…');
-    void (async () => {
-      try {
-        const tradeCounts = await syncMetaApiTradeDocuments(
-          account,
-          accountForMetaApi,
-          token,
-          region,
-          accountInfo,
-          syncRunId,
-          nowIso,
-          progressCtx,
-        );
-        await finishSuccess(tradeCounts);
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        console.error(`[MetaApi sync][${accountKey}] background trades failed:`, message);
-        await reportAccountSyncProgress(accountDocId, 'error', message);
-        await db.collection(COLLECTIONS.accounts).doc(accountDocId).set(
-          {
-            metaapi_sync_status: 'error',
-            metaapi_sync_error: `Metrics saved; trade history sync failed: ${message}`,
-            updatedAt: FieldValue.serverTimestamp(),
-          },
-          { merge: true },
-        );
+    const finishSuccess = async (tradeCounts) => {
+      if (bulk) {
+        await reportAdminBulkSyncProgressThrottled(db, COLLECTIONS, ADMIN_SYNC_PROGRESS_DOC_ID, {
+          active: true,
+          mode: 'all',
+          index: bulk.index,
+          total: bulk.total,
+          currentAccountId: accountDocId,
+          currentLogin: account.login || '',
+          phase: 'complete',
+          message: mergedProgressMessage(
+            `Saved (${tradeCounts.tradesSynced} trades, ${tradeCounts.positionsSynced} positions).`,
+          ),
+          tradesSynced: tradeCounts.tradesSynced,
+          positionsSynced: tradeCounts.positionsSynced,
+        });
       }
-    })();
 
+      forgetAccountThrottleState(accountDocId);
+      await db.collection(COLLECTIONS.accounts).doc(accountDocId).set(
+        omitUndefinedFirestoreFields({
+          metaapi_sync_status: 'success',
+          metaapi_sync_error: null,
+          last_metaapi_sync_at: nowIso,
+          updatedAt: FieldValue.serverTimestamp(),
+          metaapi_sync_progress: null,
+        }),
+        { merge: true },
+      );
+      logSyncPhase(accountKey, 'complete', syncStarted);
+      return tradeCounts;
+    };
+
+    if (tradesMode === METAAPI_TRADES_METRICS_ONLY) {
+      await report(
+        'skipped_trades',
+        'Skipped trade persistence (metrics-only sync mode); headline metrics saved.',
+      );
+      await finishSuccess({ tradesSynced: 0, positionsSynced: 0 });
+      return {
+        accountId: accountKey,
+        syncRunId,
+        tradesSynced: 0,
+        positionsSynced: 0,
+        tradesMode,
+        requestedBy,
+        syncedAt: nowIso,
+      };
+    }
+
+    if (deferTradeSync) {
+      await report('syncing_trades', 'Metrics saved. Syncing trade history in background…');
+      void (async () => {
+        try {
+          const tradeCounts = await syncMetaApiTradeDocuments(
+            account,
+            accountForMetaApi,
+            token,
+            region,
+            accountInfo,
+            syncRunId,
+            nowIso,
+            progressCtx,
+          );
+          await finishSuccess(tradeCounts);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          console.error(`[MetaApi sync][${accountKey}] background trades failed:`, message);
+          await persistTradeSyncErrorOnAccountDoc(message);
+        }
+      })();
+
+      return {
+        accountId: accountKey,
+        syncRunId,
+        tradesSynced: 0,
+        positionsSynced: 0,
+        tradesSync: 'background',
+        tradesMode,
+        requestedBy,
+        syncedAt: nowIso,
+      };
+    }
+
+    const tradeCounts = await syncMetaApiTradeDocuments(
+      account,
+      accountForMetaApi,
+      token,
+      region,
+      accountInfo,
+      syncRunId,
+      nowIso,
+      progressCtx,
+    );
+    await finishSuccess(tradeCounts);
     return {
       accountId: accountKey,
       syncRunId,
-      tradesSynced: 0,
-      positionsSynced: 0,
-      tradesSync: 'background',
+      tradesSynced: tradeCounts.tradesSynced,
+      positionsSynced: tradeCounts.positionsSynced,
+      tradesMode,
       requestedBy,
       syncedAt: nowIso,
     };
-  }
-
-  const tradeCounts = await syncMetaApiTradeDocuments(
-    account,
-    accountForMetaApi,
-    token,
-    region,
-    accountInfo,
-    syncRunId,
-    nowIso,
-    progressCtx,
-  );
-  await finishSuccess(tradeCounts);
-  return {
-    accountId: accountKey,
-    syncRunId,
-    tradesSynced: tradeCounts.tradesSynced,
-    positionsSynced: tradeCounts.positionsSynced,
-    requestedBy,
-    syncedAt: nowIso,
-  };
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
-    await reportAccountSyncProgress(accountDocId, 'error', message);
+    await flushAccountThrottleNow(
+      db,
+      COLLECTIONS,
+      accountDocId,
+      'error',
+      message,
+      {},
+      omitUndefinedFirestoreFields,
+    );
     throw err;
   }
 }
@@ -1020,7 +1102,7 @@ async function syncAllMetaApiAccountsInternal(requestedBy = 'scheduled') {
     .filter((account) => account.metaapi_account_id && account.metaapi_token);
 
   const total = eligible.length;
-  await reportAdminBulkSyncProgress({
+  await reportAdminBulkSyncProgressThrottled(db, COLLECTIONS, ADMIN_SYNC_PROGRESS_DOC_ID, {
     active: true,
     mode: 'all',
     phase: 'starting',
@@ -1031,34 +1113,40 @@ async function syncAllMetaApiAccountsInternal(requestedBy = 'scheduled') {
 
   const results = [];
   let index = 0;
+  const bulkSyncAll = requestedBy === 'admin_manual';
   for (const account of eligible) {
     index += 1;
     const accountDocId = account.id;
 
     try {
-      await db.collection(COLLECTIONS.accounts).doc(accountDocId).set({
-        metaapi_sync_status: 'running',
-        metaapi_sync_error: null,
-        updatedAt: FieldValue.serverTimestamp(),
-      }, { merge: true });
-
       const syncOptions =
-        requestedBy === 'admin_manual' ? { fullSync: true, bulkProgress: { index, total } } : { bulkProgress: { index, total } };
+        requestedBy === 'admin_manual'
+          ? { fullSync: true, bulkSyncAll, bulkProgress: { index, total } }
+          : { bulkProgress: { index, total } };
 
       const result = await syncMetaApiAccountSnapshot(account, requestedBy, syncOptions);
       results.push({ ok: true, ...result });
     } catch (error) {
-      await db.collection(COLLECTIONS.accounts).doc(accountDocId).set({
-        metaapi_sync_status: 'error',
-        metaapi_sync_error: error instanceof Error ? error.message : String(error),
-        updatedAt: FieldValue.serverTimestamp(),
-      }, { merge: true });
-      await clearAccountSyncProgress(accountDocId);
-      results.push({ ok: false, accountId: accountDocId, error: error instanceof Error ? error.message : String(error) });
+      forgetAccountThrottleState(accountDocId);
+      const msg = error instanceof Error ? error.message : String(error);
+      await db.collection(COLLECTIONS.accounts).doc(accountDocId).set(
+        omitUndefinedFirestoreFields({
+          metaapi_sync_status: 'error',
+          metaapi_sync_error: msg,
+          metaapi_sync_progress: {
+            phase: 'error',
+            message: msg,
+            updatedAt: new Date().toISOString(),
+          },
+          updatedAt: FieldValue.serverTimestamp(),
+        }),
+        { merge: true },
+      );
+      results.push({ ok: false, accountId: accountDocId, error: msg });
     }
   }
 
-  await reportAdminBulkSyncProgress({
+  await reportAdminBulkSyncProgressThrottled(db, COLLECTIONS, ADMIN_SYNC_PROGRESS_DOC_ID, {
     active: false,
     mode: 'all',
     phase: 'complete',
@@ -1078,7 +1166,7 @@ async function syncAllMetaApiAccountsInternal(requestedBy = 'scheduled') {
     createdAt: FieldValue.serverTimestamp(),
   });
 
-  return { ok: true, totalAccounts: accountsSnap.size, results };
+  return { ok: true, totalAccounts: total, results };
 }
 
 async function getMetaApiAccountInfoWithRetry(account, maxAttempts = 3) {
@@ -1118,14 +1206,6 @@ function resolveDrawdownAtCapture(metaApiInfo) {
 
 function isParticipantRankEligible(status) {
   return status !== 'disqualified' && status !== 'invalid';
-}
-
-function chunkArray(items, size) {
-  const chunks = [];
-  for (let index = 0; index < items.length; index += size) {
-    chunks.push(items.slice(index, index + size));
-  }
-  return chunks;
 }
 
 async function getParticipantsByIds(participantIds) {
@@ -1705,12 +1785,19 @@ app.post('/api/meta-api/sync-account/:accountFirestoreId', requireUser, async (r
     const accountIdParam = String(req.params.accountFirestoreId || '');
     if (accountIdParam) {
       try {
+        forgetAccountThrottleState(accountIdParam);
+        const msg = error instanceof Error ? error.message : String(error);
         await db.collection(COLLECTIONS.accounts).doc(accountIdParam).set(
-          {
+          omitUndefinedFirestoreFields({
             metaapi_sync_status: 'error',
-            metaapi_sync_error: error instanceof Error ? error.message : String(error),
+            metaapi_sync_error: msg,
+            metaapi_sync_progress: {
+              phase: 'error',
+              message: msg,
+              updatedAt: new Date().toISOString(),
+            },
             updatedAt: FieldValue.serverTimestamp(),
-          },
+          }),
           { merge: true },
         );
       } catch (_) {
@@ -1746,15 +1833,6 @@ app.post('/api/meta-api/admin/sync-account', requireAdmin, async (req, res) => {
 
     const account = { id: accountSnap.id, ...data };
 
-    await db.collection(COLLECTIONS.accounts).doc(accountSnap.id).set(
-      {
-        metaapi_sync_status: 'running',
-        metaapi_sync_error: null,
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    );
-
     const result = await syncMetaApiAccountSnapshot(account, 'admin_manual', { fullSync: true });
     console.log(`[admin sync] done accountId=${accountId}`, {
       tradesSynced: result.tradesSynced,
@@ -1765,15 +1843,21 @@ app.post('/api/meta-api/admin/sync-account', requireAdmin, async (req, res) => {
     const aid = String((req.body && req.body.accountId) || '');
     if (aid) {
       try {
+        forgetAccountThrottleState(aid);
+        const msg = error instanceof Error ? error.message : String(error);
         await db.collection(COLLECTIONS.accounts).doc(aid).set(
-          {
+          omitUndefinedFirestoreFields({
             metaapi_sync_status: 'error',
-            metaapi_sync_error: error instanceof Error ? error.message : String(error),
+            metaapi_sync_error: msg,
+            metaapi_sync_progress: {
+              phase: 'error',
+              message: msg,
+              updatedAt: new Date().toISOString(),
+            },
             updatedAt: FieldValue.serverTimestamp(),
-          },
+          }),
           { merge: true },
         );
-        await clearAccountSyncProgress(aid);
       } catch (_) {
         /* empty */
       }
