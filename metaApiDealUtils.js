@@ -138,13 +138,23 @@ function deriveSyncedMetricsPackage(terminalBalance, rawDeals, platform) {
   return { normalizedTrades, metrics };
 }
 
-async function fetchMetaApiHistoryDealsPaginated(clientApiUrl, accountId, authToken, startIso, endIsoExclusive) {
+async function fetchMetaApiHistoryDealsPaginated(
+  clientApiUrl,
+  accountId,
+  authToken,
+  startIso,
+  endIsoExclusive,
+  onProgress,
+) {
   const encodedStart = encodeURIComponent(startIso);
   const encodedEnd = encodeURIComponent(endIsoExclusive);
   const byId = new Map();
   let offset = 0;
 
   while (true) {
+    if (typeof onProgress === 'function') {
+      await onProgress({ offset, loaded: byId.size });
+    }
     const url = `${clientApiUrl}/users/current/accounts/${accountId}/history-deals/time/${encodedStart}/${encodedEnd}?offset=${offset}&limit=${HISTORY_DEALS_PAGE_LIMIT}`;
     const response = await fetch(url, {
       headers: {
@@ -160,6 +170,9 @@ async function fetchMetaApiHistoryDealsPaginated(clientApiUrl, accountId, authTo
     for (const row of rows) {
       const mapped = normalizeDeal(row);
       byId.set(mapped.id, mapped);
+    }
+    if (typeof onProgress === 'function') {
+      await onProgress({ offset, loaded: byId.size, pageRows: rows.length });
     }
     if (rows.length < HISTORY_DEALS_PAGE_LIMIT) break;
     offset += HISTORY_DEALS_PAGE_LIMIT;

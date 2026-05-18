@@ -107,6 +107,13 @@ app.use(cors(corsOptions));
 app.options('*', cors(corsOptions));
 app.use(express.json({ limit: '2mb' }));
 
+app.use((req, _res, next) => {
+  if (req.path.startsWith('/api/')) {
+    console.log(`[http] ${req.method} ${req.path}`);
+  }
+  next();
+});
+
 const COLLECTIONS = {
   users: 'users',
   settings: 'settings',
@@ -122,7 +129,10 @@ const COLLECTIONS = {
   metaApiTrades: 'metaApiTrades',
   metaApiPositions: 'metaApiPositions',
   metaApiSyncRuns: 'metaApiSyncRuns',
+  metaApiAdminSyncProgress: 'metaApiAdminSyncProgress',
 };
+
+const ADMIN_SYNC_PROGRESS_DOC_ID = 'current';
 
 const SETTINGS_DOC_ID = 'site_settings';
 
@@ -459,12 +469,19 @@ async function fetchMetaApiAccountInfo(account, token, region) {
   );
 }
 
-async function fetchMetaApiTrades(account, token, startTime, endTime, region) {
+async function fetchMetaApiTrades(account, token, startTime, endTime, region, onProgress) {
   const resolvedRegion = region || account.metaapi_region || 'new-york';
   const clientApiUrl = getClientApiUrl(resolvedRegion);
   const start = startTime || new Date(Date.now() - 90 * 24 * 60 * 60 * 1000).toISOString();
   const end = endTime || new Date().toISOString();
-  return fetchMetaApiHistoryDealsPaginated(clientApiUrl, account.metaapi_account_id, token, start, end);
+  return fetchMetaApiHistoryDealsPaginated(
+    clientApiUrl,
+    account.metaapi_account_id,
+    token,
+    start,
+    end,
+    onProgress,
+  );
 }
 
 async function fetchMetaApiPositions(account, token, region) {
@@ -552,9 +569,88 @@ function logSyncPhase(accountKey, label, startedMs) {
   console.log(`[MetaApi sync][${accountKey}] ${label} ${Date.now() - startedMs}ms`);
 }
 
-async function syncMetaApiTradeDocuments(account, accountForMetaApi, token, region, accountInfo, syncRunId, nowIso) {
+async function reportAccountSyncProgress(accountDocId, phase, message, extra = {}) {
+  if (!accountDocId) return;
+  try {
+    await db.collection(COLLECTIONS.accounts).doc(String(accountDocId)).set(
+      {
+        metaapi_sync_progress: {
+          phase,
+          message,
+          updatedAt: new Date().toISOString(),
+          ...extra,
+        },
+      },
+      { merge: true },
+    );
+  } catch (err) {
+    console.warn('[MetaApi sync] progress write failed:', err instanceof Error ? err.message : err);
+  }
+}
+
+async function clearAccountSyncProgress(accountDocId) {
+  if (!accountDocId) return;
+  try {
+    await db.collection(COLLECTIONS.accounts).doc(String(accountDocId)).set(
+      { metaapi_sync_progress: null },
+      { merge: true },
+    );
+  } catch (_) {
+    /* empty */
+  }
+}
+
+async function reportAdminBulkSyncProgress(payload) {
+  try {
+    await db.collection(COLLECTIONS.metaApiAdminSyncProgress).doc(ADMIN_SYNC_PROGRESS_DOC_ID).set(
+      {
+        active: true,
+        updatedAt: new Date().toISOString(),
+        ...payload,
+      },
+      { merge: true },
+    );
+  } catch (err) {
+    console.warn('[MetaApi sync] bulk progress write failed:', err instanceof Error ? err.message : err);
+  }
+}
+
+async function clearAdminBulkSyncProgress() {
+  try {
+    await db.collection(COLLECTIONS.metaApiAdminSyncProgress).doc(ADMIN_SYNC_PROGRESS_DOC_ID).set(
+      {
+        active: false,
+        message: 'Idle',
+        phase: 'idle',
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true },
+    );
+  } catch (_) {
+    /* empty */
+  }
+}
+
+async function syncMetaApiTradeDocuments(
+  account,
+  accountForMetaApi,
+  token,
+  region,
+  accountInfo,
+  syncRunId,
+  nowIso,
+  progressCtx = null,
+) {
   const accountKey = account.id || account.metaapi_account_id;
+  const accountDocId = String(accountKey);
   const phaseStart = Date.now();
+  const report = async (phase, message, extra = {}) => {
+    if (progressCtx?.report) {
+      await progressCtx.report(phase, message, extra);
+    } else {
+      await reportAccountSyncProgress(accountDocId, phase, message, extra);
+    }
+  };
 
   const platform =
     account.platform === 'mt4' || account.platform === 'mt5'
@@ -563,11 +659,23 @@ async function syncMetaApiTradeDocuments(account, accountForMetaApi, token, regi
         ? accountInfo.platform
         : 'mt5';
 
-  const [rawDeals, rawPositions] = await Promise.all([
-    fetchMetaApiTrades(accountForMetaApi, token, undefined, undefined, region),
-    fetchMetaApiPositions(accountForMetaApi, token, region),
-  ]);
+  await report('fetch_deals', 'Fetching trade history from MetaApi…');
+  const rawDeals = await fetchMetaApiTrades(
+    accountForMetaApi,
+    token,
+    undefined,
+    undefined,
+    region,
+    async ({ loaded, pageRows }) => {
+      if (pageRows > 0) {
+        await report('fetch_deals', `Fetching trade history… (${loaded} deals loaded)`, { dealsLoaded: loaded });
+      }
+    },
+  );
   logSyncPhase(accountKey, `fetched deals=${Array.isArray(rawDeals) ? rawDeals.length : 0}`, phaseStart);
+
+  await report('fetch_positions', 'Fetching open positions…');
+  const rawPositions = await fetchMetaApiPositions(accountForMetaApi, token, region);
 
   const { normalizedTrades } = deriveSyncedMetricsPackage(
     Number(accountInfo.balance || 0),
@@ -624,10 +732,14 @@ async function syncMetaApiTradeDocuments(account, accountForMetaApi, token, regi
   }));
 
   const writeStart = Date.now();
-  await Promise.all([
-    writeDocuments(COLLECTIONS.metaApiTrades, normalizedDeals),
-    writeDocuments(COLLECTIONS.metaApiPositions, normalizedPositions),
-  ]);
+  await report('write_trades', `Saving ${normalizedDeals.length} trades to database…`, {
+    tradesCount: normalizedDeals.length,
+  });
+  await writeDocuments(COLLECTIONS.metaApiTrades, normalizedDeals);
+  await report('write_positions', `Saving ${normalizedPositions.length} open positions…`, {
+    positionsCount: normalizedPositions.length,
+  });
+  await writeDocuments(COLLECTIONS.metaApiPositions, normalizedPositions);
   logSyncPhase(
     accountKey,
     `wrote trades=${normalizedDeals.length} positions=${normalizedPositions.length}`,
@@ -649,7 +761,31 @@ function shouldDeferTradeSync(requestedBy, options = {}) {
 async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', options = {}) {
   const deferTradeSync = shouldDeferTradeSync(requestedBy, options);
   const accountKey = account.id || account.metaapi_account_id;
+  const accountDocId = String(accountKey);
   const syncStarted = Date.now();
+  const bulk = options.bulkProgress || null;
+
+  const report = async (phase, message, extra = {}) => {
+    await reportAccountSyncProgress(accountDocId, phase, message, extra);
+    if (bulk) {
+      await reportAdminBulkSyncProgress({
+        active: true,
+        mode: 'all',
+        index: bulk.index,
+        total: bulk.total,
+        currentAccountId: accountDocId,
+        currentLogin: account.login || '',
+        phase,
+        message: bulk.total > 1 ? `Account ${bulk.index}/${bulk.total} (#${account.login || accountDocId}): ${message}` : message,
+        ...extra,
+      });
+    }
+  };
+
+  const progressCtx = { report };
+
+  try {
+  await report('starting', 'Starting MetaApi sync…');
 
   const settings = await getSiteSettings();
   const tokenCandidates = resolveMetaApiTokenCandidates(account, settings);
@@ -660,15 +796,19 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
   const metaapiCloudAccountId = assertMetaApiCloudAccountId(account.metaapi_account_id, account.login);
   const accountForMetaApi = { ...account, metaapi_account_id: metaapiCloudAccountId };
 
+  await report('provisioning', 'Fetching MetaApi account details…');
   const { token, data: regionPayload } = await requestMetaApiAccountDetailsWithTokens(
     metaapiCloudAccountId,
     tokenCandidates,
   );
   assertProvisioningReadyForClientApi(regionPayload, metaapiCloudAccountId);
   const region = resolveMetaApiHostedRegion(regionPayload, accountForMetaApi);
+
+  await report('account_info', 'Fetching live balance and equity…');
   const accountInfo = await fetchMetaApiAccountInfo(accountForMetaApi, token, region);
   logSyncPhase(accountKey, 'account info', syncStarted);
 
+  await report('metastats', 'Fetching MetaStats metrics…');
   const metaStatsRaw = await fetchMetaStatsWithProvisioningRecovery(metaapiCloudAccountId, token, region);
   let mappedMetrics;
   try {
@@ -768,7 +908,7 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
     createdAt: FieldValue.serverTimestamp(),
   };
 
-  const accountDocId = String(accountKey);
+  await report('persist_metrics', 'Saving metrics to database…');
   await db.collection(COLLECTIONS.metaApiAccountSnapshots).doc(accountDocId).set(accountSnapshot, { merge: false });
   await db.collection(COLLECTIONS.accounts).doc(accountDocId).set(
     {
@@ -785,6 +925,10 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
   logSyncPhase(accountKey, 'metrics persisted', syncStarted);
 
   const finishSuccess = async (tradeCounts) => {
+    await report('complete', 'Sync complete.', {
+      tradesSynced: tradeCounts.tradesSynced,
+      positionsSynced: tradeCounts.positionsSynced,
+    });
     await db.collection(COLLECTIONS.accounts).doc(accountDocId).set(
       {
         metaapi_sync_status: 'success',
@@ -794,11 +938,13 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
       },
       { merge: true },
     );
+    await clearAccountSyncProgress(accountDocId);
     logSyncPhase(accountKey, 'complete', syncStarted);
     return tradeCounts;
   };
 
   if (deferTradeSync) {
+    await report('syncing_trades', 'Metrics saved. Syncing trade history in background…');
     void (async () => {
       try {
         const tradeCounts = await syncMetaApiTradeDocuments(
@@ -809,11 +955,13 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
           accountInfo,
           syncRunId,
           nowIso,
+          progressCtx,
         );
         await finishSuccess(tradeCounts);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         console.error(`[MetaApi sync][${accountKey}] background trades failed:`, message);
+        await reportAccountSyncProgress(accountDocId, 'error', message);
         await db.collection(COLLECTIONS.accounts).doc(accountDocId).set(
           {
             metaapi_sync_status: 'error',
@@ -844,9 +992,9 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
     accountInfo,
     syncRunId,
     nowIso,
+    progressCtx,
   );
   await finishSuccess(tradeCounts);
-
   return {
     accountId: accountKey,
     syncRunId,
@@ -855,6 +1003,11 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
     requestedBy,
     syncedAt: nowIso,
   };
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await reportAccountSyncProgress(accountDocId, 'error', message);
+    throw err;
+  }
 }
 
 async function syncAllMetaApiAccountsInternal(requestedBy = 'scheduled') {
@@ -862,37 +1015,63 @@ async function syncAllMetaApiAccountsInternal(requestedBy = 'scheduled') {
     .where('status', '==', 'connected')
     .get();
 
+  const eligible = accountsSnap.docs
+    .map((accountDoc) => ({ id: accountDoc.id, ...accountDoc.data() }))
+    .filter((account) => account.metaapi_account_id && account.metaapi_token);
+
+  const total = eligible.length;
+  await reportAdminBulkSyncProgress({
+    active: true,
+    mode: 'all',
+    phase: 'starting',
+    message: `Starting sync for ${total} connected account(s)…`,
+    index: 0,
+    total,
+  });
+
   const results = [];
-  for (const accountDoc of accountsSnap.docs) {
-    const account = { id: accountDoc.id, ...accountDoc.data() };
-    if (!account.metaapi_account_id || !account.metaapi_token) {
-      continue;
-    }
+  let index = 0;
+  for (const account of eligible) {
+    index += 1;
+    const accountDocId = account.id;
 
     try {
-      await db.collection(COLLECTIONS.accounts).doc(accountDoc.id).set({
+      await db.collection(COLLECTIONS.accounts).doc(accountDocId).set({
         metaapi_sync_status: 'running',
         metaapi_sync_error: null,
         updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
 
-      const result = await syncMetaApiAccountSnapshot(account, requestedBy);
+      const syncOptions =
+        requestedBy === 'admin_manual' ? { fullSync: true, bulkProgress: { index, total } } : { bulkProgress: { index, total } };
+
+      const result = await syncMetaApiAccountSnapshot(account, requestedBy, syncOptions);
       results.push({ ok: true, ...result });
     } catch (error) {
-      await db.collection(COLLECTIONS.accounts).doc(accountDoc.id).set({
+      await db.collection(COLLECTIONS.accounts).doc(accountDocId).set({
         metaapi_sync_status: 'error',
         metaapi_sync_error: error instanceof Error ? error.message : String(error),
         updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
-      results.push({ ok: false, accountId: accountDoc.id, error: error instanceof Error ? error.message : String(error) });
+      await clearAccountSyncProgress(accountDocId);
+      results.push({ ok: false, accountId: accountDocId, error: error instanceof Error ? error.message : String(error) });
     }
   }
+
+  await reportAdminBulkSyncProgress({
+    active: false,
+    mode: 'all',
+    phase: 'complete',
+    message: `Finished syncing ${total} account(s).`,
+    index: total,
+    total,
+  });
 
   await db.collection(COLLECTIONS.metaApiSyncRuns).add({
     requestedBy,
     startedAt: new Date().toISOString(),
     completedAt: new Date().toISOString(),
-    totalAccounts: accountsSnap.size,
+    totalAccounts: total,
     successCount: results.filter((item) => item.ok).length,
     failureCount: results.filter((item) => !item.ok).length,
     results,
@@ -1545,6 +1724,7 @@ app.post('/api/meta-api/sync-account/:accountFirestoreId', requireUser, async (r
 app.post('/api/meta-api/admin/sync-account', requireAdmin, async (req, res) => {
   try {
     const accountId = String((req.body && req.body.accountId) || '');
+    console.log(`[admin sync] start accountId=${accountId}`);
     if (!accountId) {
       res.status(400).json({ error: 'accountId is required.' });
       return;
@@ -1575,7 +1755,11 @@ app.post('/api/meta-api/admin/sync-account', requireAdmin, async (req, res) => {
       { merge: true },
     );
 
-    const result = await syncMetaApiAccountSnapshot(account, 'admin_ui');
+    const result = await syncMetaApiAccountSnapshot(account, 'admin_manual', { fullSync: true });
+    console.log(`[admin sync] done accountId=${accountId}`, {
+      tradesSynced: result.tradesSynced,
+      positionsSynced: result.positionsSynced,
+    });
     res.json({ ok: true, accountId: accountSnap.id, ...result });
   } catch (error) {
     const aid = String((req.body && req.body.accountId) || '');
@@ -1589,6 +1773,7 @@ app.post('/api/meta-api/admin/sync-account', requireAdmin, async (req, res) => {
           },
           { merge: true },
         );
+        await clearAccountSyncProgress(aid);
       } catch (_) {
         /* empty */
       }
@@ -1599,9 +1784,16 @@ app.post('/api/meta-api/admin/sync-account', requireAdmin, async (req, res) => {
 
 app.post('/api/meta-api/admin/sync-all', requireAdmin, async (_req, res) => {
   try {
+    console.log('[admin sync-all] start (direct HTTP, not cron)');
     const summary = await syncAllMetaApiAccountsInternal('admin_manual');
+    console.log('[admin sync-all] done', {
+      totalAccounts: summary.totalAccounts,
+      successCount: summary.results?.filter((r) => r.ok).length,
+      failureCount: summary.results?.filter((r) => !r.ok).length,
+    });
     res.json(summary);
   } catch (error) {
+    await clearAdminBulkSyncProgress();
     res.status(500).json({ error: error instanceof Error ? error.message : 'MetaApi sync-all failed.' });
   }
 });
