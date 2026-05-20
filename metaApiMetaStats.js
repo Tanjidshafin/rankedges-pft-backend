@@ -70,6 +70,112 @@ function unwrapMetaStatsMetricsBody(body) {
   return body;
 }
 
+const DEFAULT_DAILY_GROWTH_MAX_POINTS = 2000;
+
+function percentForChart(value) {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  if (Math.abs(n) <= 2 && n !== 0) return Number((n * 100).toFixed(4));
+  return Number(n.toFixed(4));
+}
+
+/**
+ * Downsample series evenly while keeping first and last points.
+ * @param {unknown[]} rows
+ * @param {number} maxPoints
+ */
+function downsampleSeries(rows, maxPoints) {
+  if (!Array.isArray(rows) || rows.length <= maxPoints) return rows || [];
+  if (maxPoints < 2) return [rows[0], rows[rows.length - 1]].filter(Boolean);
+  const out = [];
+  const lastIndex = rows.length - 1;
+  for (let i = 0; i < maxPoints; i += 1) {
+    const idx = Math.round((i / (maxPoints - 1)) * lastIndex);
+    out.push(rows[idx]);
+  }
+  return out;
+}
+
+/**
+ * MetaStats dailyGrowth → Firestore-safe chart series (Myfxbook-style tabs).
+ * @param {unknown} dailyGrowth
+ * @param {{ terminalBalance?: number, terminalEquity?: number, maxPoints?: number }} [opts]
+ */
+function normalizeDailyGrowthSeries(dailyGrowth, opts = {}) {
+  if (!Array.isArray(dailyGrowth) || dailyGrowth.length === 0) return [];
+
+  const terminalBalance = Number(opts.terminalBalance);
+  const terminalEquity = Number(opts.terminalEquity);
+  const equityRatio =
+    Number.isFinite(terminalBalance) && terminalBalance > 0 && Number.isFinite(terminalEquity)
+      ? terminalEquity / terminalBalance
+      : null;
+
+  const sorted = [...dailyGrowth]
+    .filter((row) => row && typeof row === 'object' && typeof row.date === 'string')
+    .sort((a, b) => String(a.date).localeCompare(String(b.date)));
+
+  const mapped = sorted.map((row) => {
+    const balance = coerceNumber(row.balance) ?? 0;
+    const point = {
+      date: String(row.date).slice(0, 10),
+      balance,
+      totalProfit: coerceNumber(row.totalProfit) ?? 0,
+      totalGains: percentForChart(row.totalGains) ?? 0,
+    };
+    const gains = percentForChart(row.gains);
+    if (gains != null) point.gains = gains;
+    const drawdownPercentage = percentForChart(row.drawdownPercentage);
+    if (drawdownPercentage != null) point.drawdownPercentage = drawdownPercentage;
+    if (equityRatio != null && balance > 0) {
+      point.equityEstimate = Number((balance * equityRatio).toFixed(2));
+    }
+    return point;
+  });
+
+  const maxPoints = Math.max(
+    50,
+    Math.min(Number(opts.maxPoints || process.env.METASTATS_DAILY_GROWTH_MAX_POINTS) || DEFAULT_DAILY_GROWTH_MAX_POINTS, 5000),
+  );
+  const downsampled = downsampleSeries(mapped, maxPoints);
+  return sanitizeDailyGrowthSeriesForFirestore(downsampled);
+}
+
+/**
+ * Strip undefined from a single daily-growth point (Firestore-safe).
+ * @param {Record<string, unknown>} point
+ */
+function sanitizeDailyGrowthPoint(point) {
+  const out = {
+    date: String(point.date),
+    balance: Number(point.balance) || 0,
+    totalProfit: Number(point.totalProfit) || 0,
+    totalGains: Number(point.totalGains) || 0,
+  };
+  const gains = point.gains;
+  if (gains !== undefined && gains !== null && Number.isFinite(Number(gains))) {
+    out.gains = Number(gains);
+  }
+  const dd = point.drawdownPercentage;
+  if (dd !== undefined && dd !== null && Number.isFinite(Number(dd))) {
+    out.drawdownPercentage = Number(dd);
+  }
+  const equity = point.equityEstimate;
+  if (equity !== undefined && equity !== null && Number.isFinite(Number(equity))) {
+    out.equityEstimate = Number(equity);
+  }
+  return out;
+}
+
+/** @param {unknown[]} series */
+function sanitizeDailyGrowthSeriesForFirestore(series) {
+  if (!Array.isArray(series)) return [];
+  return series.map((row) =>
+    row && typeof row === 'object' ? sanitizeDailyGrowthPoint(row) : sanitizeDailyGrowthPoint({}),
+  );
+}
+
 /** Omit huge nested arrays before Firestore snapshot persist. */
 function slimMetaStatsForStorage(body) {
   if (!body || typeof body !== 'object') return body;
@@ -291,6 +397,10 @@ module.exports = {
   resolveTotalTradesFromMetaStats,
   isMetaStatsActivityEmpty,
   mergeActivityMetricsInto,
+  normalizeDailyGrowthSeries,
+  sanitizeDailyGrowthSeriesForFirestore,
+  sanitizeDailyGrowthPoint,
+  downsampleSeries,
   mapMetaStatsToAccountMetrics,
   fetchMetaStatsMetrics,
 };

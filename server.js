@@ -15,7 +15,10 @@ const {
   isMetaStatsActivityEmpty,
   mergeActivityMetricsInto,
   safeJsonSnippet,
+  unwrapMetaStatsMetricsBody,
   slimMetaStatsForStorage,
+  normalizeDailyGrowthSeries,
+  sanitizeDailyGrowthSeriesForFirestore,
   MetaStatsFetchError,
 } = require('./metaApiMetaStats');
 const {
@@ -440,13 +443,26 @@ async function writeDocuments(collectionName, docs) {
   }
 }
 
-/** Firestore rejects `undefined` field values. */
+/** Firestore rejects `undefined` at any depth (including array elements). */
 function omitUndefinedFirestoreFields(obj) {
-  if (!obj || typeof obj !== 'object') return obj;
+  if (obj === undefined) return undefined;
+  if (obj === null) return null;
+  if (Array.isArray(obj)) {
+    return obj.map((item) => omitUndefinedFirestoreFields(item));
+  }
+  if (obj instanceof Date) return obj;
+  if (typeof obj !== 'object') return obj;
+
+  const ctorName = obj.constructor?.name;
+  if (ctorName && ctorName !== 'Object') {
+    return obj;
+  }
+
   const out = {};
   for (const key of Object.keys(obj)) {
     const v = obj[key];
-    if (v !== undefined) out[key] = v;
+    if (v === undefined) continue;
+    out[key] = omitUndefinedFirestoreFields(v);
   }
   return out;
 }
@@ -1022,6 +1038,12 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
         ? mappedMetrics.total_trades
         : 0;
 
+    const metaStatsBody = unwrapMetaStatsMetricsBody(metaStatsRaw);
+    const metaapiDailyGrowth = normalizeDailyGrowthSeries(metaStatsBody?.dailyGrowth, {
+      terminalBalance: headlineBalance,
+      terminalEquity: headlineEquity,
+    });
+
     const persistMeta = {
       balance: headlineBalance,
       equity: headlineEquity,
@@ -1063,6 +1085,8 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
           : null,
       metaapi_metrics_synced_at: nowIso,
       metaapi_metrics_activity_source: metricsActivitySource,
+      metaapi_daily_growth: metaapiDailyGrowth,
+      metaapi_daily_growth_synced_at: nowIso,
     };
     console.log('[MetaStats][persist]', safeJsonSnippet(persistMeta));
 
@@ -1090,21 +1114,25 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
     };
 
     await report('persist_metrics', 'Saving metrics to database…');
-    await db.collection(COLLECTIONS.metaApiAccountSnapshots).doc(accountDocId).set(accountSnapshot, { merge: false });
+    await db.collection(COLLECTIONS.metaApiAccountSnapshots).doc(accountDocId).set(
+      omitUndefinedFirestoreFields(accountSnapshot),
+      { merge: false },
+    );
 
     const statusAfterMetrics =
       deferTradeSync && tradesMode !== METAAPI_TRADES_METRICS_ONLY ? 'syncing_trades' : 'success';
 
     await db.collection(COLLECTIONS.accounts).doc(accountDocId).set(
-      {
+      omitUndefinedFirestoreFields({
         ...persistMeta,
+        metaapi_daily_growth: sanitizeDailyGrowthSeriesForFirestore(metaapiDailyGrowth),
         metaapi_region: region,
         last_metaapi_sync_at: nowIso,
         metaapi_sync_status: statusAfterMetrics,
         metaapi_sync_error: null,
         metaapi_snapshot_version: FieldValue.increment(1),
         updatedAt: FieldValue.serverTimestamp(),
-      },
+      }),
       { merge: true },
     );
     logSyncPhase(accountKey, 'metrics persisted', syncStarted);
