@@ -37,6 +37,8 @@ const {
 } = require('./syncProgressReporter');
 const { createAchievementEngine, DEFINITION_BY_ID } = require('./achievementEngine');
 const { createNotificationAdmin } = require('./notificationAdmin');
+const { scheduleContestLifecycleCron } = require('./contestLifecycle');
+const { startContestAdmin } = require('./contestStart');
 
 const METAAPI_TRADES_FULL = 'full';
 const METAAPI_TRADES_METRICS_ONLY = 'metrics_only';
@@ -273,6 +275,49 @@ async function requireUser(req, res, next) {
   } catch (error) {
     res.status(401).json({ error: error instanceof Error ? error.message : 'Invalid auth token.' });
   }
+}
+
+function profileHasAdminPermission(profile, permission) {
+  if (!profile || profile.role !== 'admin') return false;
+  const tier = profile.adminTier || 'full';
+  if (tier === 'super' || tier === 'full') return true;
+  const perms = profile.adminPermissions || [];
+  if (perms.includes('*')) return true;
+  return perms.includes(permission);
+}
+
+function requireAdminPermission(permission) {
+  return async (req, res, next) => {
+    try {
+      const authHeader = req.headers.authorization || '';
+      const token = authHeader.startsWith('Bearer ') ? authHeader.slice(7) : '';
+      if (!token) {
+        res.status(401).json({ error: 'Missing Firebase ID token.' });
+        return;
+      }
+
+      const decoded = await admin.auth().verifyIdToken(token);
+      const userSnap = await db.collection(COLLECTIONS.users).doc(decoded.uid).get();
+      if (!userSnap.exists || userSnap.data().role !== 'admin') {
+        res.status(403).json({ error: 'Admin access required.' });
+        return;
+      }
+
+      if (!profileHasAdminPermission(userSnap.data(), permission)) {
+        res.status(403).json({ error: `Admin permission required: ${permission}` });
+        return;
+      }
+
+      req.user = {
+        uid: decoded.uid,
+        email: decoded.email || '',
+        profile: userSnap.data(),
+      };
+      next();
+    } catch (error) {
+      res.status(401).json({ error: error instanceof Error ? error.message : 'Invalid auth token.' });
+    }
+  };
 }
 
 async function requireAdmin(req, res, next) {
@@ -2043,7 +2088,7 @@ app.post('/api/meta-api/sync-account/:accountFirestoreId', requireUser, async (r
   }
 });
 
-app.post('/api/meta-api/admin/sync-account', requireAdmin, async (req, res) => {
+app.post('/api/meta-api/admin/sync-account', requireAdminPermission('accounts'), async (req, res) => {
   try {
     const accountId = String((req.body && req.body.accountId) || '');
     console.log(`[admin sync] start accountId=${accountId}`);
@@ -2101,7 +2146,7 @@ app.post('/api/meta-api/admin/sync-account', requireAdmin, async (req, res) => {
   }
 });
 
-app.post('/api/meta-api/admin/sync-all', requireAdmin, async (_req, res) => {
+app.post('/api/meta-api/admin/sync-all', requireAdminPermission('accounts'), async (_req, res) => {
   try {
     console.log('[admin sync-all] start (direct HTTP, not cron)');
     const summary = await syncAllMetaApiAccountsInternal('admin_manual');
@@ -2590,6 +2635,12 @@ function startInternalCronScheduler() {
   }
 
   startAchievementCronScheduler();
+
+  scheduleContestLifecycleCron(
+    db,
+    (contestId) => startContestAdmin(db, contestId),
+    notificationAdmin,
+  );
 }
 
 app.listen(PORT, () => {

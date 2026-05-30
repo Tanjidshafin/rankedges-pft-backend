@@ -7,7 +7,6 @@ const DEFAULT_PREFERENCES = {
   enabled: true,
   articles: true,
   contests: true,
-  pushEnabled: false,
   rankChanges: true,
   supportMessages: true,
   contestPayments: true,
@@ -24,12 +23,24 @@ const DEFAULT_PREFERENCES = {
   brokerAdded: true,
   alertSubmitted: true,
   supportTickets: true,
+  contestStartingSoon: true,
+  contestStarted: true,
   contestCompleted: true,
+  contestStatusChanges: true,
+  contestDisqualified: true,
   prizeWon: true,
   prizeDistributed: true,
   prizeProofUploaded: true,
   prizeVerified: true,
   achievements: true,
+  dataIntegrity: true,
+  integrityNotices: true,
+  adminAccessUpdates: true,
+  tradingAccountAlerts: true,
+  complianceAlerts: true,
+  platformDocs: true,
+  globalLeaderboard: false,
+  pftUpdates: true,
 };
 
 /** @type {Record<string, keyof typeof DEFAULT_PREFERENCES>} */
@@ -53,11 +64,26 @@ const notificationTypeToPreferenceKey = {
   broker_document: 'brokerDocuments',
   broker_payment: 'brokerPayments',
   contest_completed: 'contestCompleted',
+  contest_starting_soon: 'contestStartingSoon',
+  contest_started: 'contestStarted',
+  contest_status_change: 'contestStatusChanges',
+  contest_disqualified: 'contestDisqualified',
+  contest_joined: 'contests',
   prize_won: 'prizeWon',
   prize_distributed: 'prizeDistributed',
   prize_proof_uploaded: 'prizeProofUploaded',
   prize_verified: 'prizeVerified',
   achievement_unlocked: 'achievements',
+  data_integrity: 'dataIntegrity',
+  integrity_notice: 'integrityNotices',
+  trading_account_alert: 'tradingAccountAlerts',
+  cheat_flag_created: 'complianceAlerts',
+  cheat_flag_resolved: 'complianceAlerts',
+  appeal_status: 'complianceAlerts',
+  platform_doc_published: 'platformDocs',
+  global_rank_change: 'globalLeaderboard',
+  pft_participant_status: 'pftUpdates',
+  admin_access_updated: 'adminAccessUpdates',
 };
 
 /**
@@ -123,15 +149,32 @@ function createNotificationAdmin(db, collections) {
       seen: false,
       createdAt: FieldValue.serverTimestamp(),
     });
+
     return docRef.id;
+  }
+
+  /**
+   * @param {string[]} userIds
+   */
+  async function createBroadcastNotification(userIds, type, title, message, link) {
+    const unique = [...new Set(userIds.filter(Boolean))];
+    await Promise.all(
+      unique.map((userId) =>
+        createNotification({ userId, type, title, message, link }),
+      ),
+    );
   }
 
   return {
     createNotification,
+    createBroadcastNotification,
     shouldSendNotification,
+    getNotificationPreferences,
   };
 }
 
 module.exports = {
   createNotificationAdmin,
+  DEFAULT_PREFERENCES,
+  notificationTypeToPreferenceKey,
 };
