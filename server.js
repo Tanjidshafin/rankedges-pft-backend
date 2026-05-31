@@ -252,6 +252,46 @@ function maskAccountReference(accountId) {
   return `${accountId.slice(0, 2)}****${accountId.slice(-2)}`;
 }
 
+function isKnownTradingPlatform(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === 'mt4' || normalized === 'mt5';
+}
+
+function shouldReplaceTradingPlatform(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return !normalized || normalized === 'unknown';
+}
+
+function inferTradingPlatformFromServer(server) {
+  const normalized = String(server || '').toLowerCase();
+  if (!normalized) return null;
+  if (normalized.includes('mt4') || normalized.includes('metatrader 4') || normalized.includes('metatrader4')) {
+    return 'mt4';
+  }
+  if (normalized.includes('mt5') || normalized.includes('metatrader 5') || normalized.includes('metatrader5')) {
+    return 'mt5';
+  }
+  return null;
+}
+
+function resolveTradingAccountPlatform(account, participant, snapshot) {
+  for (const candidate of [
+    participant?.platform,
+    account?.platform,
+    snapshot?.platform,
+    account?.metaapi_platform,
+  ]) {
+    if (isKnownTradingPlatform(candidate)) {
+      return String(candidate).trim().toLowerCase();
+    }
+  }
+
+  const inferred = inferTradingPlatformFromServer(account?.server);
+  if (inferred) return inferred;
+
+  return 'unknown';
+}
+
 async function getSiteSettings() {
   const snap = await db.collection(COLLECTIONS.settings).doc(SETTINGS_DOC_ID).get();
   return snap.exists ? snap.data() : {};
@@ -1570,7 +1610,7 @@ async function listPftEnrollmentOptionsFast() {
       label: `${username} • ${account.broker_name} • ${account.login}`,
       userId: String(account.user_id || ''),
       username,
-      platform: account.platform || 'unknown',
+      platform: resolveTradingAccountPlatform(account),
       balance: Number(account.balance || 0),
       equity: Number(account.equity || 0),
     };
@@ -1681,6 +1721,12 @@ async function syncContestStatusFromBatch(batchId, batchData) {
   return contestId;
 }
 
+const PFT_ENROLLABLE_STATUSES = new Set(['active', 'completed', 'disqualified']);
+
+function countPftBatchEnrollments(participants) {
+  return participants.filter((participant) => PFT_ENROLLABLE_STATUSES.has(String(participant.status || ''))).length;
+}
+
 async function updateContestRankingsServer(contestId) {
   const contestSnap = await db.collection(COLLECTIONS.contests).doc(contestId).get();
   const contest = contestSnap.data();
@@ -1689,16 +1735,19 @@ async function updateContestRankingsServer(contestId) {
   const rawSnap = await db.collection(COLLECTIONS.leaderboard).where('contest_id', '==', contestId).get();
   const rawEntries = rawSnap.docs.map((item) => ({ id: item.id, ...item.data() }));
 
-  const byUser = new Map();
+  // PFT contests rank one row per trading account; other contests dedupe by user.
+  const dedupeKey = contest?.type === 'pft' ? 'account_id' : 'user_id';
+  const byKey = new Map();
   for (const entry of rawEntries) {
-    const existing = byUser.get(entry.user_id) || [];
+    const key = String(entry[dedupeKey] || entry.user_id || entry.account_id || entry.id);
+    const existing = byKey.get(key) || [];
     existing.push(entry);
-    byUser.set(entry.user_id, existing);
+    byKey.set(key, existing);
   }
 
   const deduped = [];
   const dedupeBatch = db.batch();
-  for (const [, entries] of byUser) {
+  for (const [, entries] of byKey) {
     if (entries.length === 1) {
       deduped.push(entries[0]);
       continue;
@@ -1754,7 +1803,6 @@ async function enrollParticipantInPftContest(contestId, participant, account, us
     .where('account_id', '==', accountId)
     .limit(1)
     .get();
-  if (!existingLeaderboard.empty) return { created: false };
 
   const existingParticipation = await db.collection(COLLECTIONS.contestParticipations)
     .where('contest_id', '==', contestId)
@@ -1765,8 +1813,43 @@ async function enrollParticipantInPftContest(contestId, participant, account, us
   const startingBalance = Number(participant.startingBalance || account.balance || 0);
   const nowIso = participant.joinedAt || new Date().toISOString();
   const country = String(userData?.country || '');
-  const platform = String(participant.platform || account.platform || 'unknown');
+  const platform = resolveTradingAccountPlatform(account, participant);
   const maskedAccountRef = maskAccountReference(accountId);
+
+  if (!existingLeaderboard.empty) {
+    const entryRef = existingLeaderboard.docs[0].ref;
+    const entryData = existingLeaderboard.docs[0].data();
+    const updates = {};
+
+    if (entryData.participant_status !== participantStatus) {
+      updates.participant_status = participantStatus;
+    }
+    if (isKnownTradingPlatform(platform) && shouldReplaceTradingPlatform(entryData.platform)) {
+      updates.platform = platform;
+    }
+    if (!entryData.masked_account_ref) updates.masked_account_ref = maskedAccountRef;
+    if (!entryData.pft_joined_at) updates.pft_joined_at = nowIso;
+    if (!entryData.trader_name && username) updates.trader_name = username;
+
+    if (Object.keys(updates).length > 0) {
+      updates.updatedAt = FieldValue.serverTimestamp();
+      await entryRef.set(updates, { merge: true });
+    }
+
+    if (!existingParticipation.empty) {
+      const participationUpdates = {
+        participant_status: participantStatus,
+        trader_name: username,
+      };
+      if (participantStatus === 'disqualified') {
+        participationUpdates.disqualified_at = participant.disqualifiedAt || new Date().toISOString();
+        participationUpdates.disqualified_reason = participant.disqualifiedReason || 'Disqualified';
+      }
+      await existingParticipation.docs[0].ref.set(participationUpdates, { merge: true });
+    }
+
+    return { created: false, updated: Object.keys(updates).length > 0 };
+  }
 
   if (existingParticipation.empty) {
     await db.collection(COLLECTIONS.contestParticipations).add({
@@ -1819,16 +1902,28 @@ async function syncPftBatchContestLeaderboard(batchId, contestId) {
   }
 
   const participants = await listBatchParticipants(batchId);
-  const eligibleStatuses = new Set(['active', 'completed', 'disqualified']);
   let enrolled = 0;
 
   for (const participant of participants) {
-    if (!eligibleStatuses.has(String(participant.status || ''))) continue;
+    if (!PFT_ENROLLABLE_STATUSES.has(String(participant.status || ''))) continue;
 
     const accountSnap = await db.collection(COLLECTIONS.accounts).doc(String(participant.accountId)).get();
     if (!accountSnap.exists) continue;
 
     const account = { id: accountSnap.id, ...accountSnap.data() };
+    const resolvedPlatform = resolveTradingAccountPlatform(account, participant);
+    if (
+      participant.id
+      && isKnownTradingPlatform(resolvedPlatform)
+      && shouldReplaceTradingPlatform(participant.platform)
+    ) {
+      await db.collection(COLLECTIONS.participants).doc(participant.id).set({
+        platform: resolvedPlatform,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      participant.platform = resolvedPlatform;
+    }
+
     const userSnap = await db.collection(COLLECTIONS.users).doc(String(participant.userId)).get();
     const userData = userSnap.exists ? userSnap.data() : {};
     const username = String(
@@ -1854,20 +1949,27 @@ async function syncPftBatchContestLeaderboard(batchId, contestId) {
 
   const metaResult = await backfillPftLeaderboardMeta(batchId, contestId);
 
-  const participationSnap = await db.collection(COLLECTIONS.contestParticipations)
-    .where('contest_id', '==', contestId)
-    .get();
+  const enrolledCount = countPftBatchEnrollments(participants);
   await db.collection(COLLECTIONS.contests).doc(contestId).set({
-    participants: participationSnap.size,
+    participants: enrolledCount,
+    updatedAt: FieldValue.serverTimestamp(),
+  }, { merge: true });
+  await db.collection(COLLECTIONS.batches).doc(batchId).set({
+    participantCount: enrolledCount,
     updatedAt: FieldValue.serverTimestamp(),
   }, { merge: true });
 
   await updateContestRankingsServer(contestId);
 
+  const leaderboardSnap = await db.collection(COLLECTIONS.leaderboard)
+    .where('contest_id', '==', contestId)
+    .get();
+
   return {
     enrolled,
     metaUpdated: metaResult.updated,
-    participants: participationSnap.size,
+    participants: enrolledCount,
+    performers: leaderboardSnap.size,
   };
 }
 
@@ -1887,19 +1989,26 @@ async function finalizeContestFromSnapshots(batchId, batchData, adminId) {
     if (lbSnap.empty) continue;
 
     const ref = lbSnap.docs[0].ref;
+    const entryData = lbSnap.docs[0].data();
     if (snapshot.status === 'completed') {
       const gainPercent = Number(snapshot.gainPercent || 0);
-      updateBatch.set(ref, {
+      const completedUpdates = {
         gain: gainPercent,
         score: gainPercent,
         balance: Number(snapshot.finalEquity || snapshot.finalBalance || 0),
         dd: Number(snapshot.drawdownAtCapture || 0),
         participant_status: 'completed',
-        platform: snapshot.platform || undefined,
         masked_account_ref: maskAccountReference(String(snapshot.accountId || '')),
         pft_captured_at: snapshot.captureTimestamp || batchData.completedAt || batchData.captureTimestamp || new Date().toISOString(),
         updatedAt: FieldValue.serverTimestamp(),
-      }, { merge: true });
+      };
+      if (
+        isKnownTradingPlatform(snapshot.platform)
+        && shouldReplaceTradingPlatform(entryData.platform)
+      ) {
+        completedUpdates.platform = snapshot.platform;
+      }
+      updateBatch.set(ref, completedUpdates, { merge: true });
     } else if (snapshot.status === 'disqualified') {
       updateBatch.set(ref, {
         participant_status: 'disqualified',
@@ -1961,7 +2070,7 @@ async function disqualifyParticipantInContest(contestId, participant) {
 
   const participationSnap = await db.collection(COLLECTIONS.contestParticipations)
     .where('contest_id', '==', contestId)
-    .where('user_id', '==', participant.userId)
+    .where('account_id', '==', String(participant.accountId))
     .limit(1)
     .get();
   if (!participationSnap.empty) {
@@ -2037,6 +2146,43 @@ async function backfillPftLeaderboardMeta(batchId, contestId) {
     participants.map((item) => [String(item.accountId), item]),
   );
 
+  const accountIds = [...new Set([
+    ...participants.map((item) => String(item.accountId || '')),
+    ...lbSnap.docs.map((item) => String(item.data().account_id || '')),
+  ].filter(Boolean))];
+
+  const accountMap = new Map();
+  for (const accountIdChunk of chunkArray(accountIds, 300)) {
+    const refs = accountIdChunk.map((accountId) => db.collection(COLLECTIONS.accounts).doc(accountId));
+    const docs = await db.getAll(...refs);
+    docs.forEach((docSnap) => {
+      if (!docSnap.exists) return;
+      accountMap.set(docSnap.id, { id: docSnap.id, ...docSnap.data() });
+    });
+  }
+
+  const participantPatchBatch = db.batch();
+  let participantPatches = 0;
+  participants.forEach((participant) => {
+    const account = accountMap.get(String(participant.accountId || ''));
+    const resolvedPlatform = resolveTradingAccountPlatform(account, participant);
+    if (
+      participant.id
+      && isKnownTradingPlatform(resolvedPlatform)
+      && shouldReplaceTradingPlatform(participant.platform)
+    ) {
+      participantPatchBatch.set(db.collection(COLLECTIONS.participants).doc(participant.id), {
+        platform: resolvedPlatform,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      participantPatches += 1;
+      participant.platform = resolvedPlatform;
+    }
+  });
+  if (participantPatches > 0) {
+    await participantPatchBatch.commit();
+  }
+
   const batch = db.batch();
   let updated = 0;
 
@@ -2045,14 +2191,16 @@ async function backfillPftLeaderboardMeta(batchId, contestId) {
     const accountId = String(entry.account_id || '');
     const participant = participantByAccount.get(accountId);
     const snapshot = snapshotByAccount.get(accountId);
+    const account = accountMap.get(accountId);
+    const resolvedPlatform = resolveTradingAccountPlatform(account, participant, snapshot);
     const updates = {};
 
-    if (participant) {
-      if (!entry.platform && participant.platform) updates.platform = participant.platform;
-      if (!entry.masked_account_ref) updates.masked_account_ref = maskAccountReference(accountId);
-      if (!entry.pft_joined_at) {
-        updates.pft_joined_at = participant.joinedAt || participant.startTimestamp;
-      }
+    if (isKnownTradingPlatform(resolvedPlatform) && shouldReplaceTradingPlatform(entry.platform)) {
+      updates.platform = resolvedPlatform;
+    }
+    if (!entry.masked_account_ref) updates.masked_account_ref = maskAccountReference(accountId);
+    if (!entry.pft_joined_at && participant) {
+      updates.pft_joined_at = participant.joinedAt || participant.startTimestamp;
     }
 
     if (snapshot?.captureTimestamp && !entry.pft_captured_at) {
@@ -2162,13 +2310,28 @@ async function captureBatch(batchId, requestedBy, reprocess = false) {
 
   try {
     for (const participant of participants) {
+      const accountSnap = await db.collection(COLLECTIONS.accounts).doc(String(participant.accountId)).get();
+      const account = accountSnap.exists ? { id: accountSnap.id, ...accountSnap.data() } : null;
+      const resolvedPlatform = resolveTradingAccountPlatform(account, participant);
+
+      if (
+        participant.id
+        && isKnownTradingPlatform(resolvedPlatform)
+        && shouldReplaceTradingPlatform(participant.platform)
+      ) {
+        await db.collection(COLLECTIONS.participants).doc(participant.id).set({
+          platform: resolvedPlatform,
+          updatedAt: FieldValue.serverTimestamp(),
+        }, { merge: true });
+      }
+
       const snapshotBase = {
         batchId,
         participantId: participant.id,
         accountId: participant.accountId,
         userId: participant.userId,
         username: participant.username,
-        platform: participant.platform || 'unknown',
+        platform: resolvedPlatform,
         batchNumber: batchData.batchNumber,
         joinedAt: participant.joinedAt || participant.startTimestamp,
         captureTimestamp,
@@ -2188,10 +2351,8 @@ async function captureBatch(batchId, requestedBy, reprocess = false) {
       }
 
       try {
-        const accountSnap = await db.collection(COLLECTIONS.accounts).doc(String(participant.accountId)).get();
-        if (!accountSnap.exists) throw new Error('Trading account not found.');
+        if (!account) throw new Error('Trading account not found.');
 
-        const account = { id: accountSnap.id, ...accountSnap.data() };
         const startingBalance = Number(participant.startingBalance || 0);
         const startingEquity = Number(participant.startingEquity || 0);
         if (!Number.isFinite(startingBalance) || startingBalance <= 0) {
@@ -2709,7 +2870,7 @@ app.post('/api/pft/batches/:batchId/enroll', requireAdmin, async (req, res) => {
       accountId: String(accountId),
       userId: account.user_id,
       username,
-      platform: account.platform || 'unknown',
+      platform: resolveTradingAccountPlatform(account),
       joinedAt: nowIso,
       startTimestamp: nowIso,
       startingBalance,
@@ -2722,11 +2883,6 @@ app.post('/api/pft/batches/:batchId/enroll', requireAdmin, async (req, res) => {
     });
 
     const contestId = await ensureBatchHasContest(batchId, batch, req.user.uid);
-
-    await db.collection(COLLECTIONS.batches).doc(batchId).set({
-      participantCount: Number(batch.participantCount || 0) + 1,
-      updatedAt: FieldValue.serverTimestamp(),
-    }, { merge: true });
 
     res.json({ ok: true, id: participantRef.id, contestId });
   } catch (error) {
