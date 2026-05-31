@@ -1644,12 +1644,16 @@ async function createContestForPftBatch(batchId, batchData, createdBy) {
 }
 
 async function ensureBatchHasContest(batchId, batchData, createdBy) {
-  if (batchData.contestId) return batchData.contestId;
-  const contestId = await createContestForPftBatch(batchId, batchData, createdBy);
-  await db.collection(COLLECTIONS.batches).doc(batchId).set({
-    contestId,
-    updatedAt: FieldValue.serverTimestamp(),
-  }, { merge: true });
+  let contestId = batchData.contestId;
+  if (!contestId) {
+    contestId = await createContestForPftBatch(batchId, batchData, createdBy);
+    await db.collection(COLLECTIONS.batches).doc(batchId).set({
+      contestId,
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+  }
+
+  await syncPftBatchContestLeaderboard(batchId, contestId);
   return contestId;
 }
 
@@ -1732,38 +1736,60 @@ async function updateContestRankingsServer(contestId) {
   await rankBatch.commit();
 }
 
+function mapPftParticipantStatusToContest(status) {
+  const normalized = String(status || 'active');
+  if (normalized === 'disqualified') return 'disqualified';
+  if (normalized === 'completed') return 'completed';
+  return 'active';
+}
+
 async function enrollParticipantInPftContest(contestId, participant, account, username, userData) {
-  const existingParticipation = await db.collection(COLLECTIONS.contestParticipations)
+  const accountId = String(participant.accountId || account.id || '');
+  if (!accountId) return { created: false };
+
+  const participantStatus = mapPftParticipantStatusToContest(participant.status);
+
+  const existingLeaderboard = await db.collection(COLLECTIONS.leaderboard)
     .where('contest_id', '==', contestId)
-    .where('user_id', '==', participant.userId)
+    .where('account_id', '==', accountId)
     .limit(1)
     .get();
-  if (!existingParticipation.empty) return;
+  if (!existingLeaderboard.empty) return { created: false };
+
+  const existingParticipation = await db.collection(COLLECTIONS.contestParticipations)
+    .where('contest_id', '==', contestId)
+    .where('account_id', '==', accountId)
+    .limit(1)
+    .get();
 
   const startingBalance = Number(participant.startingBalance || account.balance || 0);
   const nowIso = participant.joinedAt || new Date().toISOString();
   const country = String(userData?.country || '');
+  const platform = String(participant.platform || account.platform || 'unknown');
+  const maskedAccountRef = maskAccountReference(accountId);
 
-  await db.collection(COLLECTIONS.contestParticipations).add({
-    contest_id: contestId,
-    user_id: participant.userId,
-    account_id: participant.accountId,
-    trader_name: username,
-    trader_avatar: userData?.avatar || userData?.photoURL || '',
-    country,
-    joined_at: nowIso,
-    participant_status: 'active',
+  if (existingParticipation.empty) {
+    await db.collection(COLLECTIONS.contestParticipations).add({
+      contest_id: contestId,
+      user_id: participant.userId,
+      account_id: accountId,
+      trader_name: username,
+      trader_avatar: userData?.avatar || userData?.photoURL || '',
+      country,
+      joined_at: nowIso,
+      participant_status: participantStatus,
     starting_balance: startingBalance,
     current_balance: startingBalance,
-    peak_equity: startingBalance,
-    lowest_equity: startingBalance,
-    createdAt: FieldValue.serverTimestamp(),
-  });
+      peak_equity: startingBalance,
+      lowest_equity: startingBalance,
+      createdAt: FieldValue.serverTimestamp(),
+    });
+  }
 
   await db.collection(COLLECTIONS.leaderboard).add({
     contest_id: contestId,
     scope: 'contest',
-    account_id: participant.accountId,
+    account_id: accountId,
     user_id: participant.userId,
     trader_name: username,
     trader_avatar: userData?.avatar || userData?.photoURL || '',
@@ -1777,18 +1803,72 @@ async function enrollParticipantInPftContest(contestId, participant, account, us
     starting_balance: startingBalance,
     peak_equity: startingBalance,
     lowest_equity: startingBalance,
-    participant_status: 'active',
+    participant_status: participantStatus,
+    platform,
+    masked_account_ref: maskedAccountRef,
+    pft_joined_at: nowIso,
     createdAt: FieldValue.serverTimestamp(),
   });
 
-  const contestSnap = await db.collection(COLLECTIONS.contests).doc(contestId).get();
-  const currentCount = Number(contestSnap.data()?.participants || 0);
+  return { created: true };
+}
+
+async function syncPftBatchContestLeaderboard(batchId, contestId) {
+  if (!batchId || !contestId) {
+    return { enrolled: 0, metaUpdated: 0, participants: 0 };
+  }
+
+  const participants = await listBatchParticipants(batchId);
+  const eligibleStatuses = new Set(['active', 'completed', 'disqualified']);
+  let enrolled = 0;
+
+  for (const participant of participants) {
+    if (!eligibleStatuses.has(String(participant.status || ''))) continue;
+
+    const accountSnap = await db.collection(COLLECTIONS.accounts).doc(String(participant.accountId)).get();
+    if (!accountSnap.exists) continue;
+
+    const account = { id: accountSnap.id, ...accountSnap.data() };
+    const userSnap = await db.collection(COLLECTIONS.users).doc(String(participant.userId)).get();
+    const userData = userSnap.exists ? userSnap.data() : {};
+    const username = String(
+      participant.username
+      || userData?.name
+      || userData?.displayName
+      || userData?.email
+      || participant.userId,
+    );
+
+    const result = await enrollParticipantInPftContest(
+      contestId,
+      {
+        ...participant,
+        joinedAt: participant.joinedAt || participant.startTimestamp,
+      },
+      account,
+      username,
+      userData,
+    );
+    if (result.created) enrolled += 1;
+  }
+
+  const metaResult = await backfillPftLeaderboardMeta(batchId, contestId);
+
+  const participationSnap = await db.collection(COLLECTIONS.contestParticipations)
+    .where('contest_id', '==', contestId)
+    .get();
   await db.collection(COLLECTIONS.contests).doc(contestId).set({
-    participants: currentCount + 1,
+    participants: participationSnap.size,
     updatedAt: FieldValue.serverTimestamp(),
   }, { merge: true });
 
   await updateContestRankingsServer(contestId);
+
+  return {
+    enrolled,
+    metaUpdated: metaResult.updated,
+    participants: participationSnap.size,
+  };
 }
 
 async function finalizeContestFromSnapshots(batchId, batchData, adminId) {
@@ -1815,6 +1895,9 @@ async function finalizeContestFromSnapshots(batchId, batchData, adminId) {
         balance: Number(snapshot.finalEquity || snapshot.finalBalance || 0),
         dd: Number(snapshot.drawdownAtCapture || 0),
         participant_status: 'completed',
+        platform: snapshot.platform || undefined,
+        masked_account_ref: maskAccountReference(String(snapshot.accountId || '')),
+        pft_captured_at: snapshot.captureTimestamp || batchData.completedAt || batchData.captureTimestamp || new Date().toISOString(),
         updatedAt: FieldValue.serverTimestamp(),
       }, { merge: true });
     } else if (snapshot.status === 'disqualified') {
@@ -1926,6 +2009,8 @@ async function migratePftBatchToContest(batchDoc, adminId) {
     );
   }
 
+  await syncPftBatchContestLeaderboard(batchId, contestId);
+
   if (['completed', 'capturing', 'archived'].includes(String(batchData.status || ''))) {
     await finalizeContestFromSnapshots(batchId, { ...batchData, contestId }, adminId);
   } else {
@@ -1933,6 +2018,61 @@ async function migratePftBatchToContest(batchDoc, adminId) {
   }
 
   return { batchId, contestId, participantCount: participants.length };
+}
+
+async function backfillPftLeaderboardMeta(batchId, contestId) {
+  if (!batchId || !contestId) return { updated: 0 };
+
+  const participants = await listBatchParticipants(batchId);
+  const snapshots = await listBatchSnapshots(batchId);
+  const snapshotByAccount = new Map(
+    snapshots.map((item) => [String(item.accountId), item]),
+  );
+
+  const lbSnap = await db.collection(COLLECTIONS.leaderboard)
+    .where('contest_id', '==', contestId)
+    .get();
+
+  const participantByAccount = new Map(
+    participants.map((item) => [String(item.accountId), item]),
+  );
+
+  const batch = db.batch();
+  let updated = 0;
+
+  lbSnap.docs.forEach((docSnap) => {
+    const entry = docSnap.data();
+    const accountId = String(entry.account_id || '');
+    const participant = participantByAccount.get(accountId);
+    const snapshot = snapshotByAccount.get(accountId);
+    const updates = {};
+
+    if (participant) {
+      if (!entry.platform && participant.platform) updates.platform = participant.platform;
+      if (!entry.masked_account_ref) updates.masked_account_ref = maskAccountReference(accountId);
+      if (!entry.pft_joined_at) {
+        updates.pft_joined_at = participant.joinedAt || participant.startTimestamp;
+      }
+    }
+
+    if (snapshot?.captureTimestamp && !entry.pft_captured_at) {
+      updates.pft_captured_at = snapshot.captureTimestamp;
+    }
+
+    if (Object.keys(updates).length > 0) {
+      batch.set(docSnap.ref, {
+        ...updates,
+        updatedAt: FieldValue.serverTimestamp(),
+      }, { merge: true });
+      updated += 1;
+    }
+  });
+
+  if (updated > 0) {
+    await batch.commit();
+  }
+
+  return { updated };
 }
 
 async function buildTop200() {
@@ -2582,21 +2722,6 @@ app.post('/api/pft/batches/:batchId/enroll', requireAdmin, async (req, res) => {
     });
 
     const contestId = await ensureBatchHasContest(batchId, batch, req.user.uid);
-    await enrollParticipantInPftContest(
-      contestId,
-      {
-        id: participantRef.id,
-        batchId,
-        accountId: String(accountId),
-        userId: account.user_id,
-        username,
-        joinedAt: nowIso,
-        startingBalance,
-      },
-      account,
-      username,
-      userSnap.data() || {},
-    );
 
     await db.collection(COLLECTIONS.batches).doc(batchId).set({
       participantCount: Number(batch.participantCount || 0) + 1,
@@ -2624,6 +2749,10 @@ app.get('/api/pft/management/overview', requireAdmin, async (req, res) => {
     const batches = batchSnap.docs.map((item) => ({ id: item.id, ...item.data() }));
 
     const selectedBatchId = requestedBatchId || batches[0]?.id || '';
+    const selectedBatch = batches.find((item) => item.id === selectedBatchId);
+    if (selectedBatchId && selectedBatch?.contestId) {
+      await syncPftBatchContestLeaderboard(selectedBatchId, selectedBatch.contestId);
+    }
 
     const [participants, snapshots, jobs] = selectedBatchId
       ? await Promise.all([
@@ -2688,7 +2817,13 @@ app.post('/api/pft/migrate-to-contests', requireAdmin, async (req, res) => {
     for (const batchDoc of batchSnap.docs) {
       const batchData = batchDoc.data();
       if (batchData.contestId) {
-        results.push({ batchId: batchDoc.id, contestId: batchData.contestId, skipped: true });
+        const sync = await syncPftBatchContestLeaderboard(batchDoc.id, batchData.contestId);
+        results.push({
+          batchId: batchDoc.id,
+          contestId: batchData.contestId,
+          skipped: true,
+          ...sync,
+        });
         continue;
       }
       const migrated = await migratePftBatchToContest(batchDoc, req.user.uid);
@@ -2697,6 +2832,62 @@ app.post('/api/pft/migrate-to-contests', requireAdmin, async (req, res) => {
     res.json({ ok: true, migrated: results.filter((item) => !item.skipped).length, results });
   } catch (error) {
     res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to migrate PFT batches.' });
+  }
+});
+
+app.post('/api/pft/backfill-leaderboard-meta', requireAdmin, async (_req, res) => {
+  try {
+    const batchSnap = await db.collection(COLLECTIONS.batches).get();
+    const results = [];
+    for (const batchDoc of batchSnap.docs) {
+      const batchData = batchDoc.data();
+      if (!batchData.contestId) {
+        results.push({ batchId: batchDoc.id, skipped: true, reason: 'no_contest' });
+        continue;
+      }
+      const sync = await syncPftBatchContestLeaderboard(batchDoc.id, batchData.contestId);
+      results.push({
+        batchId: batchDoc.id,
+        contestId: batchData.contestId,
+        ...sync,
+        skipped: false,
+      });
+    }
+    res.json({
+      ok: true,
+      totalEnrolled: results.reduce((sum, item) => sum + Number(item.enrolled || 0), 0),
+      totalMetaUpdated: results.reduce((sum, item) => sum + Number(item.metaUpdated || 0), 0),
+      results,
+    });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to backfill PFT leaderboard metadata.' });
+  }
+});
+
+app.post('/api/pft/contests/:contestId/sync-leaderboard', async (req, res) => {
+  try {
+    const contestId = String(req.params.contestId || '').trim();
+    if (!contestId) {
+      res.status(400).json({ error: 'contestId is required.' });
+      return;
+    }
+
+    const contestSnap = await db.collection(COLLECTIONS.contests).doc(contestId).get();
+    if (!contestSnap.exists) {
+      res.status(404).json({ error: 'Contest not found.' });
+      return;
+    }
+
+    const contest = contestSnap.data();
+    if (contest.type !== 'pft' || !contest.pft_batch_id) {
+      res.status(400).json({ error: 'This contest is not linked to a PFT batch.' });
+      return;
+    }
+
+    const sync = await syncPftBatchContestLeaderboard(String(contest.pft_batch_id), contestId);
+    res.json({ ok: true, contestId, batchId: contest.pft_batch_id, ...sync });
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to sync PFT contest leaderboard.' });
   }
 });
 
