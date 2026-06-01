@@ -39,6 +39,11 @@ const { createAchievementEngine, DEFINITION_BY_ID } = require('./achievementEngi
 const { createNotificationAdmin } = require('./notificationAdmin');
 const { scheduleContestLifecycleCron } = require('./contestLifecycle');
 const { startContestAdmin } = require('./contestStart');
+const {
+  mapPftParticipantStatusToContest,
+  rankPftLeaderboardEntries,
+  buildPftLeaderboardFields,
+} = require('./pftScoring');
 
 const METAAPI_TRADES_FULL = 'full';
 const METAAPI_TRADES_METRICS_ONLY = 'metrics_only';
@@ -90,6 +95,7 @@ const INTERNAL_CRON_ENABLED = String(process.env.PFT_CRON_ENABLED || 'false').to
 const INTERNAL_CRON_TIMEZONE = process.env.PFT_CRON_TIMEZONE || 'UTC';
 const INTERNAL_CRON_SYNC_SCHEDULE = process.env.PFT_CRON_SYNC_SCHEDULE || '0 0,12 * * *';
 const INTERNAL_CRON_CAPTURE_SCHEDULE = process.env.PFT_CRON_CAPTURE_SCHEDULE || '5 0 * * *';
+const INTERNAL_CRON_PFT_LIVE_SCHEDULE = process.env.PFT_CRON_LIVE_SCHEDULE || '*/30 * * * *';
 const ACHIEVEMENT_CRON_ENABLED =
   process.env.ACHIEVEMENT_CRON_ENABLED !== undefined
     ? String(process.env.ACHIEVEMENT_CRON_ENABLED).toLowerCase() === 'true'
@@ -109,6 +115,7 @@ const ACHIEVEMENT_CRON_PAGE_SIZE = Math.max(
 const schedulerState = {
   syncRunning: false,
   captureRunning: false,
+  pftLiveRunning: false,
   achievementCronRunning: false,
 };
 function initializeFirebaseAdmin() {
@@ -1727,16 +1734,17 @@ function countPftBatchEnrollments(participants) {
   return participants.filter((participant) => PFT_ENROLLABLE_STATUSES.has(String(participant.status || ''))).length;
 }
 
-async function updateContestRankingsServer(contestId) {
+async function updateContestRankingsServer(contestId, options = {}) {
+  const { force = false } = options;
   const contestSnap = await db.collection(COLLECTIONS.contests).doc(contestId).get();
-  const contest = contestSnap.data();
-  if (contest?.rankings_locked) return;
+  const contest = contestSnap.exists ? { id: contestSnap.id, ...contestSnap.data() } : null;
+  if (!contest) return;
+  if (contest.rankings_locked && !force) return;
 
   const rawSnap = await db.collection(COLLECTIONS.leaderboard).where('contest_id', '==', contestId).get();
   const rawEntries = rawSnap.docs.map((item) => ({ id: item.id, ...item.data() }));
 
-  // PFT contests rank one row per trading account; other contests dedupe by user.
-  const dedupeKey = contest?.type === 'pft' ? 'account_id' : 'user_id';
+  const dedupeKey = contest.type === 'pft' ? 'account_id' : 'user_id';
   const byKey = new Map();
   for (const entry of rawEntries) {
     const key = String(entry[dedupeKey] || entry.user_id || entry.account_id || entry.id);
@@ -1760,86 +1768,103 @@ async function updateContestRankingsServer(contestId) {
   }
   await dedupeBatch.commit();
 
-  const active = deduped.filter((entry) => entry.participant_status !== 'disqualified');
-  const disqualified = deduped.filter((entry) => entry.participant_status === 'disqualified');
-  const sorted = [...active].sort((left, right) => {
-    if ((Number(right.score) || 0) !== (Number(left.score) || 0)) {
-      return (Number(right.score) || 0) - (Number(left.score) || 0);
-    }
-    if ((Number(left.dd) || 0) !== (Number(right.dd) || 0)) {
-      return (Number(left.dd) || 0) - (Number(right.dd) || 0);
-    }
-    const leftTime = left.createdAt?.toMillis?.() ?? 0;
-    const rightTime = right.createdAt?.toMillis?.() ?? 0;
-    return leftTime - rightTime;
-  });
-  const allRanked = [...sorted, ...disqualified];
+  let allRanked;
+  if (contest.type === 'pft') {
+    const batchSnap = contest.pft_batch_id
+      ? await db.collection(COLLECTIONS.batches).doc(String(contest.pft_batch_id)).get()
+      : null;
+    const batchData = batchSnap?.exists ? batchSnap.data() : null;
+    allRanked = rankPftLeaderboardEntries(deduped, {
+      rankingsLocked: Boolean(contest.rankings_locked),
+      captureTimestamp: batchData?.captureTimestamp || contest.completed_at,
+    });
+  } else {
+    const active = deduped.filter((entry) => entry.participant_status !== 'disqualified');
+    const disqualified = deduped.filter((entry) => entry.participant_status === 'disqualified');
+    const sorted = [...active].sort((left, right) => {
+      if ((Number(right.score) || 0) !== (Number(left.score) || 0)) {
+        return (Number(right.score) || 0) - (Number(left.score) || 0);
+      }
+      if ((Number(left.dd) || 0) !== (Number(right.dd) || 0)) {
+        return (Number(left.dd) || 0) - (Number(right.dd) || 0);
+      }
+      const leftTime = left.createdAt?.toMillis?.() ?? 0;
+      const rightTime = right.createdAt?.toMillis?.() ?? 0;
+      return leftTime - rightTime;
+    });
+    allRanked = [...sorted, ...disqualified].map((entry, index) => ({ ...entry, rank: index + 1 }));
+  }
 
   const rankBatch = db.batch();
-  allRanked.forEach((entry, index) => {
+  allRanked.forEach((entry) => {
     rankBatch.set(db.collection(COLLECTIONS.leaderboard).doc(entry.id), {
-      rank: index + 1,
+      rank: entry.rank,
       updatedAt: FieldValue.serverTimestamp(),
     }, { merge: true });
   });
   await rankBatch.commit();
 }
 
-function mapPftParticipantStatusToContest(status) {
-  const normalized = String(status || 'active');
-  if (normalized === 'disqualified') return 'disqualified';
-  if (normalized === 'completed') return 'completed';
-  return 'active';
+async function loadPftBatchForParticipant(participant) {
+  if (!participant?.batchId) return null;
+  const batchSnap = await db.collection(COLLECTIONS.batches).doc(String(participant.batchId)).get();
+  if (!batchSnap.exists) return null;
+  return { id: batchSnap.id, ...batchSnap.data() };
 }
 
 async function enrollParticipantInPftContest(contestId, participant, account, username, userData) {
   const accountId = String(participant.accountId || account.id || '');
   if (!accountId) return { created: false };
 
+  const [contestSnap, batch, existingLeaderboard, existingParticipation] = await Promise.all([
+    db.collection(COLLECTIONS.contests).doc(contestId).get(),
+    loadPftBatchForParticipant(participant),
+    db.collection(COLLECTIONS.leaderboard)
+      .where('contest_id', '==', contestId)
+      .where('account_id', '==', accountId)
+      .limit(1)
+      .get(),
+    db.collection(COLLECTIONS.contestParticipations)
+      .where('contest_id', '==', contestId)
+      .where('account_id', '==', accountId)
+      .limit(1)
+      .get(),
+  ]);
+
+  const contest = contestSnap.exists ? contestSnap.data() : null;
+  const rankingsLocked = Boolean(contest?.rankings_locked);
   const participantStatus = mapPftParticipantStatusToContest(participant.status);
-
-  const existingLeaderboard = await db.collection(COLLECTIONS.leaderboard)
-    .where('contest_id', '==', contestId)
-    .where('account_id', '==', accountId)
-    .limit(1)
-    .get();
-
-  const existingParticipation = await db.collection(COLLECTIONS.contestParticipations)
-    .where('contest_id', '==', contestId)
-    .where('account_id', '==', accountId)
-    .limit(1)
-    .get();
-
-  const startingBalance = Number(participant.startingBalance || account.balance || 0);
   const nowIso = participant.joinedAt || new Date().toISOString();
   const country = String(userData?.country || '');
-  const platform = resolveTradingAccountPlatform(account, participant);
-  const maskedAccountRef = maskAccountReference(accountId);
+  const startingBalance = Number(participant.startingBalance || account.balance || 0);
+  const startingEquity = Number(participant.startingEquity || account.equity || startingBalance);
+
+  const pftFields = buildPftLeaderboardFields({
+    participant,
+    account,
+    snapshot: null,
+    batch,
+    existingEntry: existingLeaderboard.empty ? null : existingLeaderboard.docs[0].data(),
+    rankingsLocked,
+    maskAccountRef: maskAccountReference,
+    resolvePlatform: resolveTradingAccountPlatform,
+  });
 
   if (!existingLeaderboard.empty) {
     const entryRef = existingLeaderboard.docs[0].ref;
-    const entryData = existingLeaderboard.docs[0].data();
-    const updates = {};
-
-    if (entryData.participant_status !== participantStatus) {
-      updates.participant_status = participantStatus;
-    }
-    if (isKnownTradingPlatform(platform) && shouldReplaceTradingPlatform(entryData.platform)) {
-      updates.platform = platform;
-    }
-    if (!entryData.masked_account_ref) updates.masked_account_ref = maskedAccountRef;
-    if (!entryData.pft_joined_at) updates.pft_joined_at = nowIso;
-    if (!entryData.trader_name && username) updates.trader_name = username;
-
-    if (Object.keys(updates).length > 0) {
-      updates.updatedAt = FieldValue.serverTimestamp();
-      await entryRef.set(updates, { merge: true });
-    }
+    await entryRef.set({
+      ...pftFields,
+      trader_name: username,
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
 
     if (!existingParticipation.empty) {
       const participationUpdates = {
         participant_status: participantStatus,
         trader_name: username,
+        current_balance: pftFields.balance,
+        peak_equity: pftFields.peak_equity,
+        lowest_equity: pftFields.lowest_equity,
       };
       if (participantStatus === 'disqualified') {
         participationUpdates.disqualified_at = participant.disqualifiedAt || new Date().toISOString();
@@ -1848,7 +1873,7 @@ async function enrollParticipantInPftContest(contestId, participant, account, us
       await existingParticipation.docs[0].ref.set(participationUpdates, { merge: true });
     }
 
-    return { created: false, updated: Object.keys(updates).length > 0 };
+    return { created: false, updated: true };
   }
 
   if (existingParticipation.empty) {
@@ -1861,10 +1886,10 @@ async function enrollParticipantInPftContest(contestId, participant, account, us
       country,
       joined_at: nowIso,
       participant_status: participantStatus,
-    starting_balance: startingBalance,
-    current_balance: startingBalance,
-      peak_equity: startingBalance,
-      lowest_equity: startingBalance,
+      starting_balance: startingBalance,
+      current_balance: pftFields.balance,
+      peak_equity: startingEquity,
+      lowest_equity: startingEquity,
       createdAt: FieldValue.serverTimestamp(),
     });
   }
@@ -1877,31 +1902,162 @@ async function enrollParticipantInPftContest(contestId, participant, account, us
     trader_name: username,
     trader_avatar: userData?.avatar || userData?.photoURL || '',
     country,
-    gain: 0,
-    dd: 0,
-    profit: 0,
-    balance: startingBalance,
     rank: 1,
-    score: 0,
-    starting_balance: startingBalance,
-    peak_equity: startingBalance,
-    lowest_equity: startingBalance,
-    participant_status: participantStatus,
-    platform,
-    masked_account_ref: maskedAccountRef,
-    pft_joined_at: nowIso,
+    ...pftFields,
     createdAt: FieldValue.serverTimestamp(),
   });
 
   return { created: true };
 }
 
-async function syncPftBatchContestLeaderboard(batchId, contestId) {
-  if (!batchId || !contestId) {
-    return { enrolled: 0, metaUpdated: 0, participants: 0 };
+async function syncPftLeaderboardFields(batchId, contestId) {
+  if (!batchId || !contestId) return { updated: 0 };
+
+  const [participants, snapshots, batchSnap, contestSnap, lbSnap] = await Promise.all([
+    listBatchParticipants(batchId),
+    listBatchSnapshots(batchId),
+    db.collection(COLLECTIONS.batches).doc(batchId).get(),
+    db.collection(COLLECTIONS.contests).doc(contestId).get(),
+    db.collection(COLLECTIONS.leaderboard).where('contest_id', '==', contestId).get(),
+  ]);
+
+  const batch = batchSnap.exists ? { id: batchSnap.id, ...batchSnap.data() } : { id: batchId };
+  const contest = contestSnap.exists ? contestSnap.data() : null;
+  const rankingsLocked = Boolean(contest?.rankings_locked);
+  const officialSnapshots = snapshots.filter((item) => item.isOfficial !== false);
+  const snapshotByAccount = new Map(
+    officialSnapshots.map((item) => [String(item.accountId), item]),
+  );
+  const participantByAccount = new Map(
+    participants.map((item) => [String(item.accountId), item]),
+  );
+
+  const accountIds = [...new Set([
+    ...participants.map((item) => String(item.accountId || '')),
+    ...lbSnap.docs.map((item) => String(item.data().account_id || '')),
+  ].filter(Boolean))];
+
+  const accountMap = new Map();
+  for (const accountIdChunk of chunkArray(accountIds, 300)) {
+    const refs = accountIdChunk.map((accountId) => db.collection(COLLECTIONS.accounts).doc(accountId));
+    const docs = await db.getAll(...refs);
+    docs.forEach((docSnap) => {
+      if (!docSnap.exists) return;
+      accountMap.set(docSnap.id, { id: docSnap.id, ...docSnap.data() });
+    });
   }
 
-  const participants = await listBatchParticipants(batchId);
+  const writeBatch = db.batch();
+  let updated = 0;
+
+  lbSnap.docs.forEach((docSnap) => {
+    const entry = docSnap.data();
+    const accountId = String(entry.account_id || '');
+    const participant = participantByAccount.get(accountId);
+    if (!participant) return;
+
+    const account = accountMap.get(accountId);
+    if (!account) return;
+
+    const snapshot = snapshotByAccount.get(accountId);
+    const fields = buildPftLeaderboardFields({
+      participant,
+      account,
+      snapshot,
+      batch,
+      existingEntry: entry,
+      rankingsLocked,
+      maskAccountRef: maskAccountReference,
+      resolvePlatform: resolveTradingAccountPlatform,
+    });
+
+    writeBatch.set(docSnap.ref, {
+      ...fields,
+      trader_name: entry.trader_name || participant.username,
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
+    updated += 1;
+  });
+
+  if (updated > 0) {
+    await writeBatch.commit();
+  }
+
+  return { updated };
+}
+
+/** @deprecated Use syncPftLeaderboardFields */
+async function backfillPftLeaderboardMeta(batchId, contestId) {
+  return syncPftLeaderboardFields(batchId, contestId);
+}
+
+async function syncPftLiveLeaderboardMetrics(batchId, contestId) {
+  if (!batchId || !contestId) {
+    return { metricsUpdated: 0 };
+  }
+
+  const [batchSnap, contestSnap] = await Promise.all([
+    db.collection(COLLECTIONS.batches).doc(batchId).get(),
+    db.collection(COLLECTIONS.contests).doc(contestId).get(),
+  ]);
+
+  if (!batchSnap.exists || !contestSnap.exists) {
+    return { metricsUpdated: 0 };
+  }
+
+  const batch = { id: batchSnap.id, ...batchSnap.data() };
+  const contest = contestSnap.data();
+  if (contest.rankings_locked) {
+    return { metricsUpdated: 0, skipped: true, reason: 'rankings_locked' };
+  }
+
+  const batchStatus = String(batch.status || '');
+  if (!['active', 'scheduled'].includes(batchStatus)) {
+    return { metricsUpdated: 0, skipped: true, reason: 'batch_not_live' };
+  }
+
+  const fieldResult = await syncPftLeaderboardFields(batchId, contestId);
+  await updateContestRankingsServer(contestId);
+
+  return { metricsUpdated: fieldResult.updated, skipped: false };
+}
+
+async function refreshActivePftLiveLeaderboards() {
+  const batchSnap = await db.collection(COLLECTIONS.batches).where('status', '==', 'active').get();
+  const results = [];
+
+  for (const batchDoc of batchSnap.docs) {
+    const batchData = batchDoc.data();
+    if (!batchData.contestId) continue;
+    try {
+      const result = await syncPftLiveLeaderboardMetrics(batchDoc.id, batchData.contestId);
+      results.push({ batchId: batchDoc.id, contestId: batchData.contestId, ...result });
+    } catch (error) {
+      results.push({
+        batchId: batchDoc.id,
+        contestId: batchData.contestId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return { ok: true, batches: results.length, results };
+}
+
+async function syncPftBatchContestLeaderboard(batchId, contestId) {
+  if (!batchId || !contestId) {
+    return { enrolled: 0, metaUpdated: 0, participants: 0, metricsUpdated: 0 };
+  }
+
+  const [participants, batchSnap, contestSnap] = await Promise.all([
+    listBatchParticipants(batchId),
+    db.collection(COLLECTIONS.batches).doc(batchId).get(),
+    db.collection(COLLECTIONS.contests).doc(contestId).get(),
+  ]);
+
+  const batchData = batchSnap.exists ? { id: batchSnap.id, ...batchSnap.data() } : { id: batchId };
+  const contest = contestSnap.exists ? contestSnap.data() : null;
+  const batchStatus = String(batchData.status || '');
   let enrolled = 0;
 
   for (const participant of participants) {
@@ -1947,7 +2103,24 @@ async function syncPftBatchContestLeaderboard(batchId, contestId) {
     if (result.created) enrolled += 1;
   }
 
-  const metaResult = await backfillPftLeaderboardMeta(batchId, contestId);
+  let metricsUpdated = 0;
+  let metaUpdated = 0;
+  if (['completed', 'capturing', 'archived'].includes(batchStatus)) {
+    const fieldResult = await syncPftLeaderboardFields(batchId, contestId);
+    metaUpdated = fieldResult.updated;
+    await finalizeContestFromSnapshots(batchId, { ...batchData, contestId }, 'sync');
+    await updateContestRankingsServer(contestId, { force: true });
+    metricsUpdated = metaUpdated;
+  } else if (batchStatus === 'active') {
+    const liveResult = await syncPftLiveLeaderboardMetrics(batchId, contestId);
+    metricsUpdated = liveResult.metricsUpdated || 0;
+    metaUpdated = metricsUpdated;
+  } else {
+    const fieldResult = await syncPftLeaderboardFields(batchId, contestId);
+    metricsUpdated = fieldResult.updated;
+    metaUpdated = metricsUpdated;
+    await updateContestRankingsServer(contestId);
+  }
 
   const enrolledCount = countPftBatchEnrollments(participants);
   await db.collection(COLLECTIONS.contests).doc(contestId).set({
@@ -1959,7 +2132,9 @@ async function syncPftBatchContestLeaderboard(batchId, contestId) {
     updatedAt: FieldValue.serverTimestamp(),
   }, { merge: true });
 
-  await updateContestRankingsServer(contestId);
+  if (!['completed', 'capturing', 'archived'].includes(batchStatus) && batchStatus !== 'active') {
+    await updateContestRankingsServer(contestId);
+  }
 
   const leaderboardSnap = await db.collection(COLLECTIONS.leaderboard)
     .where('contest_id', '==', contestId)
@@ -1967,9 +2142,47 @@ async function syncPftBatchContestLeaderboard(batchId, contestId) {
 
   return {
     enrolled,
-    metaUpdated: metaResult.updated,
+    metaUpdated,
+    metricsUpdated,
     participants: enrolledCount,
     performers: leaderboardSnap.size,
+  };
+}
+
+async function recomputeAllPftContestRankings(adminId) {
+  const batchSnap = await db.collection(COLLECTIONS.batches).get();
+  const results = [];
+
+  for (const batchDoc of batchSnap.docs) {
+    const batchData = batchDoc.data();
+    if (!batchData.contestId) {
+      results.push({ batchId: batchDoc.id, skipped: true, reason: 'no_contest' });
+      continue;
+    }
+
+    try {
+      const sync = await syncPftBatchContestLeaderboard(batchDoc.id, batchData.contestId);
+      results.push({
+        batchId: batchDoc.id,
+        contestId: batchData.contestId,
+        skipped: false,
+        ...sync,
+      });
+    } catch (error) {
+      results.push({
+        batchId: batchDoc.id,
+        contestId: batchData.contestId,
+        skipped: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    recomputed: results.filter((item) => !item.skipped && !item.error).length,
+    results,
+    requestedBy: adminId,
   };
 }
 
@@ -1977,48 +2190,68 @@ async function finalizeContestFromSnapshots(batchId, batchData, adminId) {
   const contestId = batchData.contestId;
   if (!contestId) return;
 
-  const snapshots = await listBatchSnapshots(batchId);
+  const [snapshots, participants] = await Promise.all([
+    listBatchSnapshots(batchId),
+    listBatchParticipants(batchId),
+  ]);
+  const batchRecord = { id: batchId, ...batchData };
+  const participantByAccount = new Map(
+    participants.map((item) => [String(item.accountId), item]),
+  );
+  const officialSnapshots = snapshots.filter((item) => item.isOfficial !== false);
+
+  const accountIds = [...new Set(officialSnapshots.map((item) => String(item.accountId || '')).filter(Boolean))];
+  const accountMap = new Map();
+  for (const accountIdChunk of chunkArray(accountIds, 300)) {
+    const refs = accountIdChunk.map((accountId) => db.collection(COLLECTIONS.accounts).doc(accountId));
+    const docs = await db.getAll(...refs);
+    docs.forEach((docSnap) => {
+      if (!docSnap.exists) return;
+      accountMap.set(docSnap.id, { id: docSnap.id, ...docSnap.data() });
+    });
+  }
+
   const updateBatch = db.batch();
 
-  for (const snapshot of snapshots) {
+  for (const snapshot of officialSnapshots) {
+    if (!['completed', 'disqualified'].includes(String(snapshot.status || ''))) continue;
+
+    const accountId = String(snapshot.accountId || '');
+    const participant = participantByAccount.get(accountId);
+    const account = accountMap.get(accountId);
+    if (!participant) continue;
+
     const lbSnap = await db.collection(COLLECTIONS.leaderboard)
       .where('contest_id', '==', contestId)
-      .where('account_id', '==', String(snapshot.accountId))
+      .where('account_id', '==', accountId)
       .limit(1)
       .get();
     if (lbSnap.empty) continue;
 
     const ref = lbSnap.docs[0].ref;
     const entryData = lbSnap.docs[0].data();
-    if (snapshot.status === 'completed') {
-      const gainPercent = Number(snapshot.gainPercent || 0);
-      const completedUpdates = {
-        gain: gainPercent,
-        score: gainPercent,
-        balance: Number(snapshot.finalEquity || snapshot.finalBalance || 0),
-        dd: Number(snapshot.drawdownAtCapture || 0),
-        participant_status: 'completed',
-        masked_account_ref: maskAccountReference(String(snapshot.accountId || '')),
-        pft_captured_at: snapshot.captureTimestamp || batchData.completedAt || batchData.captureTimestamp || new Date().toISOString(),
-        updatedAt: FieldValue.serverTimestamp(),
-      };
-      if (
-        isKnownTradingPlatform(snapshot.platform)
-        && shouldReplaceTradingPlatform(entryData.platform)
-      ) {
-        completedUpdates.platform = snapshot.platform;
-      }
-      updateBatch.set(ref, completedUpdates, { merge: true });
-    } else if (snapshot.status === 'disqualified') {
-      updateBatch.set(ref, {
-        participant_status: 'disqualified',
-        updatedAt: FieldValue.serverTimestamp(),
-      }, { merge: true });
-    }
+    const fields = buildPftLeaderboardFields({
+      participant: {
+        ...participant,
+        status: snapshot.status === 'disqualified' ? 'disqualified' : participant.status,
+      },
+      account: account || { id: accountId },
+      snapshot,
+      batch: batchRecord,
+      existingEntry: entryData,
+      rankingsLocked: true,
+      maskAccountRef: maskAccountReference,
+      resolvePlatform: resolveTradingAccountPlatform,
+    });
+
+    updateBatch.set(ref, {
+      ...fields,
+      updatedAt: FieldValue.serverTimestamp(),
+    }, { merge: true });
   }
 
   await updateBatch.commit();
-  await updateContestRankingsServer(contestId);
+  await updateContestRankingsServer(contestId, { force: true });
 
   const leaderboardSnap = await db.collection(COLLECTIONS.leaderboard)
     .where('contest_id', '==', contestId)
@@ -2127,100 +2360,6 @@ async function migratePftBatchToContest(batchDoc, adminId) {
   }
 
   return { batchId, contestId, participantCount: participants.length };
-}
-
-async function backfillPftLeaderboardMeta(batchId, contestId) {
-  if (!batchId || !contestId) return { updated: 0 };
-
-  const participants = await listBatchParticipants(batchId);
-  const snapshots = await listBatchSnapshots(batchId);
-  const snapshotByAccount = new Map(
-    snapshots.map((item) => [String(item.accountId), item]),
-  );
-
-  const lbSnap = await db.collection(COLLECTIONS.leaderboard)
-    .where('contest_id', '==', contestId)
-    .get();
-
-  const participantByAccount = new Map(
-    participants.map((item) => [String(item.accountId), item]),
-  );
-
-  const accountIds = [...new Set([
-    ...participants.map((item) => String(item.accountId || '')),
-    ...lbSnap.docs.map((item) => String(item.data().account_id || '')),
-  ].filter(Boolean))];
-
-  const accountMap = new Map();
-  for (const accountIdChunk of chunkArray(accountIds, 300)) {
-    const refs = accountIdChunk.map((accountId) => db.collection(COLLECTIONS.accounts).doc(accountId));
-    const docs = await db.getAll(...refs);
-    docs.forEach((docSnap) => {
-      if (!docSnap.exists) return;
-      accountMap.set(docSnap.id, { id: docSnap.id, ...docSnap.data() });
-    });
-  }
-
-  const participantPatchBatch = db.batch();
-  let participantPatches = 0;
-  participants.forEach((participant) => {
-    const account = accountMap.get(String(participant.accountId || ''));
-    const resolvedPlatform = resolveTradingAccountPlatform(account, participant);
-    if (
-      participant.id
-      && isKnownTradingPlatform(resolvedPlatform)
-      && shouldReplaceTradingPlatform(participant.platform)
-    ) {
-      participantPatchBatch.set(db.collection(COLLECTIONS.participants).doc(participant.id), {
-        platform: resolvedPlatform,
-        updatedAt: FieldValue.serverTimestamp(),
-      }, { merge: true });
-      participantPatches += 1;
-      participant.platform = resolvedPlatform;
-    }
-  });
-  if (participantPatches > 0) {
-    await participantPatchBatch.commit();
-  }
-
-  const batch = db.batch();
-  let updated = 0;
-
-  lbSnap.docs.forEach((docSnap) => {
-    const entry = docSnap.data();
-    const accountId = String(entry.account_id || '');
-    const participant = participantByAccount.get(accountId);
-    const snapshot = snapshotByAccount.get(accountId);
-    const account = accountMap.get(accountId);
-    const resolvedPlatform = resolveTradingAccountPlatform(account, participant, snapshot);
-    const updates = {};
-
-    if (isKnownTradingPlatform(resolvedPlatform) && shouldReplaceTradingPlatform(entry.platform)) {
-      updates.platform = resolvedPlatform;
-    }
-    if (!entry.masked_account_ref) updates.masked_account_ref = maskAccountReference(accountId);
-    if (!entry.pft_joined_at && participant) {
-      updates.pft_joined_at = participant.joinedAt || participant.startTimestamp;
-    }
-
-    if (snapshot?.captureTimestamp && !entry.pft_captured_at) {
-      updates.pft_captured_at = snapshot.captureTimestamp;
-    }
-
-    if (Object.keys(updates).length > 0) {
-      batch.set(docSnap.ref, {
-        ...updates,
-        updatedAt: FieldValue.serverTimestamp(),
-      }, { merge: true });
-      updated += 1;
-    }
-  });
-
-  if (updated > 0) {
-    await batch.commit();
-  }
-
-  return { updated };
 }
 
 async function buildTop200() {
@@ -3040,10 +3179,29 @@ app.post('/api/pft/contests/:contestId/sync-leaderboard', async (req, res) => {
       return;
     }
 
+    const batchSnap = await db.collection(COLLECTIONS.batches).doc(String(contest.pft_batch_id)).get();
+    const batchData = batchSnap.exists ? batchSnap.data() : null;
+    const batchStatus = String(batchData?.status || '');
+
     const sync = await syncPftBatchContestLeaderboard(String(contest.pft_batch_id), contestId);
-    res.json({ ok: true, contestId, batchId: contest.pft_batch_id, ...sync });
+    res.json({
+      ok: true,
+      contestId,
+      batchId: contest.pft_batch_id,
+      batchStatus,
+      ...sync,
+    });
   } catch (error) {
     res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to sync PFT contest leaderboard.' });
+  }
+});
+
+app.post('/api/pft/recompute-rankings', requireAdmin, async (req, res) => {
+  try {
+    const result = await recomputeAllPftContestRankings(req.user.uid);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to recompute PFT rankings.' });
   }
 });
 
@@ -3281,8 +3439,18 @@ function startInternalCronScheduler() {
         { timezone: INTERNAL_CRON_TIMEZONE },
       );
 
+      if (cron.validate(INTERNAL_CRON_PFT_LIVE_SCHEDULE)) {
+        cron.schedule(
+          INTERNAL_CRON_PFT_LIVE_SCHEDULE,
+          wrapCronTask('pft-live-leaderboard', 'pftLiveRunning', () => refreshActivePftLiveLeaderboards()),
+          { timezone: INTERNAL_CRON_TIMEZONE },
+        );
+      } else {
+        console.error(`Invalid PFT live leaderboard schedule: ${INTERNAL_CRON_PFT_LIVE_SCHEDULE}`);
+      }
+
       console.log(
-        `PFT internal scheduler enabled (timezone=${INTERNAL_CRON_TIMEZONE}, sync='${INTERNAL_CRON_SYNC_SCHEDULE}', capture='${INTERNAL_CRON_CAPTURE_SCHEDULE}').`,
+        `PFT internal scheduler enabled (timezone=${INTERNAL_CRON_TIMEZONE}, sync='${INTERNAL_CRON_SYNC_SCHEDULE}', capture='${INTERNAL_CRON_CAPTURE_SCHEDULE}', live='${INTERNAL_CRON_PFT_LIVE_SCHEDULE}').`,
       );
     }
   } else {
