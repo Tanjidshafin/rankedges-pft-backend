@@ -1743,6 +1743,34 @@ function countPftBatchEnrollments(participants) {
   return participants.filter((participant) => PFT_ENROLLABLE_STATUSES.has(String(participant.status || ''))).length;
 }
 
+async function applyPftSnapshotStatusesToEntries(entries, batchId) {
+  if (!batchId || entries.length === 0) return entries;
+
+  const snapshots = await listBatchSnapshots(batchId);
+  const officialByAccount = new Map();
+  for (const snapshot of snapshots.filter((item) => item.isOfficial !== false)) {
+    const accountId = String(snapshot.accountId || '');
+    if (!accountId || officialByAccount.has(accountId)) continue;
+    officialByAccount.set(accountId, String(snapshot.status || ''));
+  }
+  if (officialByAccount.size === 0) return entries;
+
+  return entries.map((entry) => {
+    const snapshotStatus = officialByAccount.get(String(entry.account_id || ''));
+    if (!snapshotStatus) return entry;
+    if (snapshotStatus === 'completed') {
+      return { ...entry, participant_status: 'completed' };
+    }
+    if (snapshotStatus === 'failed_capture') {
+      return { ...entry, participant_status: 'failed_capture' };
+    }
+    if (snapshotStatus === 'disqualified') {
+      return { ...entry, participant_status: 'disqualified' };
+    }
+    return entry;
+  });
+}
+
 async function updateContestRankingsServer(contestId, options = {}) {
   const { force = false } = options;
   const contestSnap = await db.collection(COLLECTIONS.contests).doc(contestId).get();
@@ -1751,7 +1779,7 @@ async function updateContestRankingsServer(contestId, options = {}) {
   if (contest.rankings_locked && !force) return;
 
   const rawSnap = await db.collection(COLLECTIONS.leaderboard).where('contest_id', '==', contestId).get();
-  const rawEntries = rawSnap.docs.map((item) => ({ id: item.id, ...item.data() }));
+  let rawEntries = rawSnap.docs.map((item) => ({ id: item.id, ...item.data() }));
 
   const dedupeKey = contest.type === 'pft' ? 'account_id' : 'user_id';
   const byKey = new Map();
@@ -1783,10 +1811,35 @@ async function updateContestRankingsServer(contestId, options = {}) {
       ? await db.collection(COLLECTIONS.batches).doc(String(contest.pft_batch_id)).get()
       : null;
     const batchData = batchSnap?.exists ? batchSnap.data() : null;
-    allRanked = rankPftLeaderboardEntries(deduped, {
-      rankingsLocked: Boolean(contest.rankings_locked),
+    const batchStatus = String(batchData?.status || '');
+    const rankingsLockedForPft =
+      Boolean(contest.rankings_locked) || ['completed', 'capturing', 'archived'].includes(batchStatus);
+
+    let entriesForRank = deduped;
+    if (rankingsLockedForPft && contest.pft_batch_id) {
+      entriesForRank = await applyPftSnapshotStatusesToEntries(deduped, String(contest.pft_batch_id));
+    }
+
+    allRanked = rankPftLeaderboardEntries(entriesForRank, {
+      rankingsLocked: rankingsLockedForPft,
       captureTimestamp: batchData?.captureTimestamp || contest.completed_at,
     });
+
+    if (rankingsLockedForPft) {
+      const statusBatch = db.batch();
+      allRanked.forEach((entry) => {
+        if (!entry.id || !entry.participant_status) return;
+        statusBatch.set(
+          db.collection(COLLECTIONS.leaderboard).doc(entry.id),
+          {
+            participant_status: entry.participant_status,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+      });
+      await statusBatch.commit();
+    }
   } else {
     const active = deduped.filter((entry) => entry.participant_status !== 'disqualified');
     const disqualified = deduped.filter((entry) => entry.participant_status === 'disqualified');

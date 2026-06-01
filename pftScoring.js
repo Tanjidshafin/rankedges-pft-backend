@@ -87,16 +87,23 @@ function rankPftLeaderboardEntries(entries, options = {}) {
     return [...rankedCompleted, ...unranked];
   }
 
-  const active = entries.filter((entry) => entry.participant_status !== 'disqualified');
-  const disqualified = entries.filter((entry) => entry.participant_status === 'disqualified');
+  const rankable = entries.filter(
+    (entry) => entry.participant_status !== 'disqualified' && entry.participant_status !== 'failed_capture',
+  );
+  const nonRankable = entries.filter(
+    (entry) => entry.participant_status === 'disqualified' || entry.participant_status === 'failed_capture',
+  );
 
-  const sortedActive = [...active].sort((left, right) => comparePftLeaderboardEntries(left, right, options));
-  const allRanked = [...sortedActive, ...disqualified];
-
-  return allRanked.map((entry, index) => ({
+  const sortedRankable = [...rankable].sort((left, right) => comparePftLeaderboardEntries(left, right, options));
+  const rankedRankable = sortedRankable.map((entry, index) => ({
     ...entry,
     rank: index + 1,
   }));
+  const unranked = nonRankable.map((entry) => ({
+    ...entry,
+    rank: null,
+  }));
+  return [...rankedRankable, ...unranked];
 }
 
 /**
