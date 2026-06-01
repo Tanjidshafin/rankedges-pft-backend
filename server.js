@@ -43,6 +43,7 @@ const {
   mapPftParticipantStatusToContest,
   rankPftLeaderboardEntries,
   buildPftLeaderboardFields,
+  sanitizePftLeaderboardFields,
 } = require('./pftScoring');
 
 const METAAPI_TRADES_FULL = 'full';
@@ -157,7 +158,15 @@ function initializeFirebaseAdmin() {
 initializeFirebaseAdmin();
 
 const db = admin.firestore();
+db.settings({ ignoreUndefinedProperties: true });
 const FieldValue = admin.firestore.FieldValue;
+
+function pftLeaderboardPayload(fields, extra = {}) {
+  return omitUndefinedFirestoreFields({
+    ...sanitizePftLeaderboardFields(fields),
+    ...extra,
+  });
+}
 
 const DEFAULT_DEV_ORIGINS = [
   'http://localhost:8080',
@@ -1852,11 +1861,13 @@ async function enrollParticipantInPftContest(contestId, participant, account, us
 
   if (!existingLeaderboard.empty) {
     const entryRef = existingLeaderboard.docs[0].ref;
-    await entryRef.set({
-      ...pftFields,
-      trader_name: username,
-      updatedAt: FieldValue.serverTimestamp(),
-    }, { merge: true });
+    await entryRef.set(
+      pftLeaderboardPayload(pftFields, {
+        trader_name: username,
+        updatedAt: FieldValue.serverTimestamp(),
+      }),
+      { merge: true },
+    );
 
     if (!existingParticipation.empty) {
       const participationUpdates = {
@@ -1870,42 +1881,48 @@ async function enrollParticipantInPftContest(contestId, participant, account, us
         participationUpdates.disqualified_at = participant.disqualifiedAt || new Date().toISOString();
         participationUpdates.disqualified_reason = participant.disqualifiedReason || 'Disqualified';
       }
-      await existingParticipation.docs[0].ref.set(participationUpdates, { merge: true });
+      await existingParticipation.docs[0].ref.set(
+        omitUndefinedFirestoreFields(participationUpdates),
+        { merge: true },
+      );
     }
 
     return { created: false, updated: true };
   }
 
   if (existingParticipation.empty) {
-    await db.collection(COLLECTIONS.contestParticipations).add({
+    await db.collection(COLLECTIONS.contestParticipations).add(
+      omitUndefinedFirestoreFields({
+        contest_id: contestId,
+        user_id: participant.userId,
+        account_id: accountId,
+        trader_name: username,
+        trader_avatar: userData?.avatar || userData?.photoURL || '',
+        country,
+        joined_at: nowIso,
+        participant_status: participantStatus,
+        starting_balance: startingBalance,
+        current_balance: pftFields.balance,
+        peak_equity: startingEquity,
+        lowest_equity: startingEquity,
+        createdAt: FieldValue.serverTimestamp(),
+      }),
+    );
+  }
+
+  await db.collection(COLLECTIONS.leaderboard).add(
+    pftLeaderboardPayload(pftFields, {
       contest_id: contestId,
-      user_id: participant.userId,
+      scope: 'contest',
       account_id: accountId,
+      user_id: participant.userId,
       trader_name: username,
       trader_avatar: userData?.avatar || userData?.photoURL || '',
       country,
-      joined_at: nowIso,
-      participant_status: participantStatus,
-      starting_balance: startingBalance,
-      current_balance: pftFields.balance,
-      peak_equity: startingEquity,
-      lowest_equity: startingEquity,
+      rank: 1,
       createdAt: FieldValue.serverTimestamp(),
-    });
-  }
-
-  await db.collection(COLLECTIONS.leaderboard).add({
-    contest_id: contestId,
-    scope: 'contest',
-    account_id: accountId,
-    user_id: participant.userId,
-    trader_name: username,
-    trader_avatar: userData?.avatar || userData?.photoURL || '',
-    country,
-    rank: 1,
-    ...pftFields,
-    createdAt: FieldValue.serverTimestamp(),
-  });
+    }),
+  );
 
   return { created: true };
 }
@@ -1971,11 +1988,14 @@ async function syncPftLeaderboardFields(batchId, contestId) {
       resolvePlatform: resolveTradingAccountPlatform,
     });
 
-    writeBatch.set(docSnap.ref, {
-      ...fields,
-      trader_name: entry.trader_name || participant.username,
-      updatedAt: FieldValue.serverTimestamp(),
-    }, { merge: true });
+    writeBatch.set(
+      docSnap.ref,
+      pftLeaderboardPayload(fields, {
+        trader_name: entry.trader_name || participant.username,
+        updatedAt: FieldValue.serverTimestamp(),
+      }),
+      { merge: true },
+    );
     updated += 1;
   });
 
@@ -2244,10 +2264,11 @@ async function finalizeContestFromSnapshots(batchId, batchData, adminId) {
       resolvePlatform: resolveTradingAccountPlatform,
     });
 
-    updateBatch.set(ref, {
-      ...fields,
-      updatedAt: FieldValue.serverTimestamp(),
-    }, { merge: true });
+    updateBatch.set(
+      ref,
+      pftLeaderboardPayload(fields, { updatedAt: FieldValue.serverTimestamp() }),
+      { merge: true },
+    );
   }
 
   await updateBatch.commit();

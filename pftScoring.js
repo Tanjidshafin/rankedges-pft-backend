@@ -108,36 +108,50 @@ function buildPftLeaderboardFields({
     ? resolvePlatform(account, participant, snapshot)
     : (participant?.platform || account?.platform || 'unknown');
 
-  const batchId = String(batch?.id || participant?.batchId || '');
-  const batchNumber = Number(batch?.batchNumber ?? existingEntry?.pft_batch_number ?? 0) || undefined;
+  const batchId = String(batch?.id || participant?.batchId || existingEntry?.pft_batch_id || '');
+  const batchNumberRaw = Number(batch?.batchNumber ?? existingEntry?.pft_batch_number ?? 0);
+  const batchNumber = Number.isFinite(batchNumberRaw) && batchNumberRaw > 0 ? batchNumberRaw : 0;
+
+  const participantId = participant?.id
+    ? String(participant.id)
+    : (existingEntry?.pft_participant_id ? String(existingEntry.pft_participant_id) : '');
 
   const basePft = {
-    pft_participant_id: participant?.id ? String(participant.id) : existingEntry?.pft_participant_id,
-    pft_batch_id: batchId || existingEntry?.pft_batch_id,
+    pft_participant_id: participantId,
+    pft_batch_id: batchId,
     pft_batch_number: batchNumber,
     pft_starting_equity: startingEquity,
     pft_baseline_value: startingBalance,
     pft_gain_baseline_type: PFT_GAIN_BASELINE_TYPE,
     pft_gain_formula_version: PFT_GAIN_FORMULA_VERSION,
     platform,
-    masked_account_ref: maskAccountRef ? maskAccountRef(accountId) : existingEntry?.masked_account_ref,
+    masked_account_ref: maskAccountRef
+      ? maskAccountRef(accountId)
+      : (existingEntry?.masked_account_ref || (accountId ? `${accountId.slice(0, 2)}****${accountId.slice(-2)}` : 'N/A')),
     pft_joined_at: joinedAt,
     starting_balance: startingBalance,
     participant_status: participantStatus,
   };
 
   if (participantStatus === 'disqualified') {
+    const fallbackEquity = asFiniteNumber(
+      existingEntry?.pft_final_equity ?? account?.equity ?? account?.balance,
+      startingEquity,
+    );
     return {
       ...basePft,
       gain: asFiniteNumber(existingEntry?.gain, 0),
       score: asFiniteNumber(existingEntry?.score, 0),
       dd: asFiniteNumber(existingEntry?.dd, 0),
       profit: asFiniteNumber(existingEntry?.profit, 0),
-      balance: asFiniteNumber(existingEntry?.balance, startingBalance),
-      peak_equity: asFiniteNumber(existingEntry?.peak_equity, startingEquity),
-      lowest_equity: asFiniteNumber(existingEntry?.lowest_equity, startingEquity),
-      pft_final_equity: existingEntry?.pft_final_equity,
-      pft_final_balance: existingEntry?.pft_final_balance,
+      balance: asFiniteNumber(existingEntry?.balance, fallbackEquity),
+      peak_equity: asFiniteNumber(existingEntry?.peak_equity, fallbackEquity),
+      lowest_equity: asFiniteNumber(existingEntry?.lowest_equity, fallbackEquity),
+      pft_final_equity: fallbackEquity,
+      pft_final_balance: asFiniteNumber(
+        existingEntry?.pft_final_balance ?? account?.balance,
+        fallbackEquity,
+      ),
       pft_disqualified_at: participant?.disqualifiedAt || existingEntry?.pft_disqualified_at || new Date().toISOString(),
       pft_disqualified_reason: participant?.disqualifiedReason || existingEntry?.pft_disqualified_reason || 'Disqualified',
     };
@@ -161,7 +175,12 @@ function buildPftLeaderboardFields({
       lowest_equity: Math.min(finalEquity, startingEquity),
       pft_final_equity: finalEquity,
       pft_final_balance: finalBalance,
-      pft_captured_at: snapshot.captureTimestamp || existingEntry?.pft_captured_at,
+      pft_captured_at:
+        snapshot.captureTimestamp
+        || existingEntry?.pft_captured_at
+        || batch?.captureTimestamp
+        || batch?.completedAt
+        || new Date().toISOString(),
       participant_status: 'completed',
     };
   }
@@ -190,6 +209,17 @@ function buildPftLeaderboardFields({
   };
 }
 
+/** Remove undefined values before Firestore writes (Admin SDK rejects undefined). */
+function sanitizePftLeaderboardFields(fields) {
+  const out = { ...fields };
+  for (const key of Object.keys(out)) {
+    if (out[key] === undefined) {
+      delete out[key];
+    }
+  }
+  return out;
+}
+
 module.exports = {
   PFT_GAIN_FORMULA_VERSION,
   PFT_GAIN_BASELINE_TYPE,
@@ -199,4 +229,5 @@ module.exports = {
   comparePftLeaderboardEntries,
   rankPftLeaderboardEntries,
   buildPftLeaderboardFields,
+  sanitizePftLeaderboardFields,
 };
