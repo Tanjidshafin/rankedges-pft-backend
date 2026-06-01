@@ -1806,10 +1806,15 @@ async function updateContestRankingsServer(contestId, options = {}) {
 
   const rankBatch = db.batch();
   allRanked.forEach((entry) => {
-    rankBatch.set(db.collection(COLLECTIONS.leaderboard).doc(entry.id), {
-      rank: entry.rank,
+    const rankPayload = {
       updatedAt: FieldValue.serverTimestamp(),
-    }, { merge: true });
+    };
+    if (entry.rank == null) {
+      rankPayload.rank = FieldValue.delete();
+    } else {
+      rankPayload.rank = entry.rank;
+    }
+    rankBatch.set(db.collection(COLLECTIONS.leaderboard).doc(entry.id), rankPayload, { merge: true });
   });
   await rankBatch.commit();
 }
@@ -2234,7 +2239,8 @@ async function finalizeContestFromSnapshots(batchId, batchData, adminId) {
   const updateBatch = db.batch();
 
   for (const snapshot of officialSnapshots) {
-    if (!['completed', 'disqualified'].includes(String(snapshot.status || ''))) continue;
+    const snapshotStatus = String(snapshot.status || '');
+    if (!['completed', 'disqualified', 'failed_capture'].includes(snapshotStatus)) continue;
 
     const accountId = String(snapshot.accountId || '');
     const participant = participantByAccount.get(accountId);
@@ -2250,12 +2256,55 @@ async function finalizeContestFromSnapshots(batchId, batchData, adminId) {
 
     const ref = lbSnap.docs[0].ref;
     const entryData = lbSnap.docs[0].data();
+    let participantStatus = participant.status;
+    if (snapshotStatus === 'disqualified') participantStatus = 'disqualified';
+    else if (snapshotStatus === 'failed_capture') participantStatus = 'failed_capture';
+    else if (snapshotStatus === 'completed') participantStatus = 'completed';
+
     const fields = buildPftLeaderboardFields({
       participant: {
         ...participant,
-        status: snapshot.status === 'disqualified' ? 'disqualified' : participant.status,
+        status: participantStatus,
       },
       account: account || { id: accountId },
+      snapshot,
+      batch: batchRecord,
+      existingEntry: entryData,
+      rankingsLocked: true,
+      maskAccountRef: maskAccountReference,
+      resolvePlatform: resolveTradingAccountPlatform,
+    });
+
+    updateBatch.set(
+      ref,
+      pftLeaderboardPayload(fields, { updatedAt: FieldValue.serverTimestamp() }),
+      { merge: true },
+    );
+  }
+
+  for (const participant of participants) {
+    if (String(participant.status || '') !== 'failed_capture') continue;
+    const accountId = String(participant.accountId || '');
+    if (!accountId) continue;
+
+    const lbSnap = await db.collection(COLLECTIONS.leaderboard)
+      .where('contest_id', '==', contestId)
+      .where('account_id', '==', accountId)
+      .limit(1)
+      .get();
+    if (lbSnap.empty) continue;
+
+    const ref = lbSnap.docs[0].ref;
+    const entryData = lbSnap.docs[0].data();
+    if (entryData.participant_status === 'failed_capture') continue;
+
+    const account = accountMap.get(accountId) || { id: accountId };
+    const snapshot = officialSnapshots.find(
+      (item) => String(item.accountId) === accountId && String(item.status) === 'failed_capture',
+    );
+    const fields = buildPftLeaderboardFields({
+      participant: { ...participant, status: 'failed_capture' },
+      account,
       snapshot,
       batch: batchRecord,
       existingEntry: entryData,
@@ -2279,7 +2328,7 @@ async function finalizeContestFromSnapshots(batchId, batchData, adminId) {
     .get();
   const sorted = leaderboardSnap.docs
     .map((item) => ({ id: item.id, ...item.data() }))
-    .filter((entry) => entry.participant_status !== 'disqualified')
+    .filter((entry) => entry.participant_status === 'completed')
     .sort((left, right) => (Number(left.rank) || 999) - (Number(right.rank) || 999));
   const winnerUserIds = sorted.filter((entry) => Number(entry.rank) <= 3).map((entry) => entry.user_id);
 
@@ -2294,14 +2343,32 @@ async function finalizeContestFromSnapshots(batchId, batchData, adminId) {
     updatedAt: FieldValue.serverTimestamp(),
   }, { merge: true });
 
+  const completedAccountIds = new Set(
+    officialSnapshots
+      .filter((item) => String(item.status) === 'completed')
+      .map((item) => String(item.accountId || ''))
+      .filter(Boolean),
+  );
+  const failedAccountIds = new Set(
+    officialSnapshots
+      .filter((item) => String(item.status) === 'failed_capture')
+      .map((item) => String(item.accountId || ''))
+      .filter(Boolean),
+  );
+
   const participationsSnap = await db.collection(COLLECTIONS.contestParticipations)
     .where('contest_id', '==', contestId)
     .get();
   const participationBatch = db.batch();
   participationsSnap.docs.forEach((item) => {
     const data = item.data();
-    if (data.participant_status !== 'disqualified') {
+    if (data.participant_status === 'disqualified') return;
+
+    const accountId = String(data.account_id || '');
+    if (completedAccountIds.has(accountId)) {
       participationBatch.set(item.ref, { participant_status: 'completed' }, { merge: true });
+    } else if (failedAccountIds.has(accountId)) {
+      participationBatch.set(item.ref, { participant_status: 'failed_capture' }, { merge: true });
     }
   });
   await participationBatch.commit();

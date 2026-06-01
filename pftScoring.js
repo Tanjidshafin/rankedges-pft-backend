@@ -28,6 +28,7 @@ function mapPftParticipantStatusToContest(status) {
   const normalized = String(status || 'active');
   if (normalized === 'disqualified') return 'disqualified';
   if (normalized === 'completed') return 'completed';
+  if (normalized === 'failed_capture') return 'failed_capture';
   return 'active';
 }
 
@@ -65,9 +66,27 @@ function comparePftLeaderboardEntries(left, right, options = {}) {
 }
 
 /**
- * Assign ranks to deduped entries; disqualified rows rank after all active.
+ * Assign ranks to deduped entries.
+ * When rankings are locked, only completed rows receive public ranks 1..N.
  */
 function rankPftLeaderboardEntries(entries, options = {}) {
+  const { rankingsLocked = false } = options;
+
+  if (rankingsLocked) {
+    const completed = entries.filter((entry) => entry.participant_status === 'completed');
+    const nonPublic = entries.filter((entry) => entry.participant_status !== 'completed');
+    const sortedCompleted = [...completed].sort((left, right) => comparePftLeaderboardEntries(left, right, options));
+    const rankedCompleted = sortedCompleted.map((entry, index) => ({
+      ...entry,
+      rank: index + 1,
+    }));
+    const unranked = nonPublic.map((entry) => ({
+      ...entry,
+      rank: null,
+    }));
+    return [...rankedCompleted, ...unranked];
+  }
+
   const active = entries.filter((entry) => entry.participant_status !== 'disqualified');
   const disqualified = entries.filter((entry) => entry.participant_status === 'disqualified');
 
@@ -157,7 +176,10 @@ function buildPftLeaderboardFields({
     };
   }
 
-  const useCompletedSnapshot = rankingsLocked && snapshot?.status === 'completed';
+  const snapshotStatus = String(snapshot?.status || '');
+  const rawParticipantStatus = String(participant?.status || existingEntry?.participant_status || '');
+
+  const useCompletedSnapshot = rankingsLocked && snapshotStatus === 'completed';
   if (useCompletedSnapshot) {
     const finalEquity = asFiniteNumber(snapshot.finalEquity ?? snapshot.finalBalance, startingEquity);
     const finalBalance = asFiniteNumber(snapshot.finalBalance, finalEquity);
@@ -183,6 +205,41 @@ function buildPftLeaderboardFields({
         || new Date().toISOString(),
       participant_status: 'completed',
     };
+  }
+
+  if (rankingsLocked) {
+    const shouldMarkFailed =
+      snapshotStatus === 'failed_capture'
+      || rawParticipantStatus === 'failed_capture'
+      || (
+        snapshotStatus !== 'completed'
+        && rawParticipantStatus !== 'completed'
+        && rawParticipantStatus !== 'disqualified'
+        && snapshotStatus !== 'disqualified'
+      );
+
+    if (shouldMarkFailed) {
+      const fallbackEquity = asFiniteNumber(
+        existingEntry?.pft_final_equity ?? account?.equity ?? account?.balance,
+        startingEquity,
+      );
+      return {
+        ...basePft,
+        participant_status: 'failed_capture',
+        gain: asFiniteNumber(existingEntry?.gain, 0),
+        score: asFiniteNumber(existingEntry?.score, 0),
+        dd: asFiniteNumber(existingEntry?.dd, 0),
+        profit: asFiniteNumber(existingEntry?.profit, 0),
+        balance: asFiniteNumber(existingEntry?.balance, fallbackEquity),
+        peak_equity: asFiniteNumber(existingEntry?.peak_equity, fallbackEquity),
+        lowest_equity: asFiniteNumber(existingEntry?.lowest_equity, fallbackEquity),
+        pft_final_equity: fallbackEquity,
+        pft_final_balance: asFiniteNumber(
+          existingEntry?.pft_final_balance ?? account?.balance,
+          fallbackEquity,
+        ),
+      };
+    }
   }
 
   const currentEquity = asFiniteNumber(account?.equity ?? account?.balance, startingEquity);
