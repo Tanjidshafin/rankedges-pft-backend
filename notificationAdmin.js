@@ -82,6 +82,8 @@ const notificationTypeToPreferenceKey = {
   contest_started: 'contestStarted',
   contest_status_change: 'contestStatusChanges',
   contest_disqualified: 'contestDisqualified',
+  contest_withdrawn: 'contestDisqualified',
+  contest_leaderboard_removed: 'contestDisqualified',
   contest_joined: 'contests',
   prize_won: 'prizeWon',
   prize_distributed: 'prizeDistributed',

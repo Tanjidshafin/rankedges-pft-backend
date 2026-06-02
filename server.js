@@ -38,7 +38,14 @@ const {
 const { createAchievementEngine, DEFINITION_BY_ID } = require('./achievementEngine');
 const { createNotificationAdmin } = require('./notificationAdmin');
 const { scheduleContestLifecycleCron } = require('./contestLifecycle');
-const { startContestAdmin } = require('./contestStart');
+const { startContestAdmin, normalizeContestStatus } = require('./contestStart');
+const {
+  listContestParticipations,
+  assignRandomTeams,
+  tryAutoStartContestPrivileged,
+  lookupUserByEmail,
+  removeContestParticipantPrivileged,
+} = require('./contestPrivileged');
 const {
   mapPftParticipantStatusToContest,
   rankPftLeaderboardEntries,
@@ -1269,6 +1276,14 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
         { merge: true },
       );
       logSyncPhase(accountKey, 'complete', syncStarted);
+      try {
+        await syncAccountToContestData(accountDocId);
+      } catch (contestSyncErr) {
+        console.error(
+          `[MetaApi sync][${accountKey}] contest leaderboard sync failed:`,
+          contestSyncErr instanceof Error ? contestSyncErr.message : contestSyncErr,
+        );
+      }
       return tradeCounts;
     };
 
@@ -1771,6 +1786,121 @@ async function applyPftSnapshotStatusesToEntries(entries, batchId) {
   });
 }
 
+function calculateContestScore(gain, dd, profit, balance, scoringMode) {
+  switch (scoringMode) {
+    case 'profit':
+      return Number(profit) || 0;
+    case 'balance':
+      return Number(balance) || 0;
+    case 'risk_adjusted': {
+      const drawdown = Number(dd) || 0;
+      return drawdown > 0 ? (Number(gain) || 0) / drawdown : Number(gain) || 0;
+    }
+    case 'gain':
+    default:
+      return Number(gain) || 0;
+  }
+}
+
+async function syncAccountToContestData(accountId) {
+  const accountSnap = await db.collection(COLLECTIONS.accounts).doc(String(accountId)).get();
+  if (!accountSnap.exists) return;
+  const account = { id: accountSnap.id, ...accountSnap.data() };
+  const currentBalance = Number(account.balance) || 0;
+
+  const lbSnap = await db.collection(COLLECTIONS.leaderboard).where('account_id', '==', String(accountId)).get();
+  const affectedContestIds = new Set();
+
+  for (const lbDoc of lbSnap.docs) {
+    const entry = { id: lbDoc.id, ...lbDoc.data() };
+    if (entry.participant_status === 'disqualified' || entry.participant_status === 'withdrawn') {
+      continue;
+    }
+
+    const contestSnap = await db.collection(COLLECTIONS.contests).doc(String(entry.contest_id)).get();
+    if (!contestSnap.exists) continue;
+    const contest = contestSnap.data();
+    if (contest.type === 'pft') continue;
+    if (normalizeContestStatus(contest.status) === 'completed') continue;
+    if (contest.rankings_locked) continue;
+
+    const startingBalance = Number(entry.starting_balance) || 0;
+    const peakEquity = Math.max(Number(entry.peak_equity) || currentBalance, currentBalance);
+    const lowestEquity = Math.min(Number(entry.lowest_equity) || currentBalance, currentBalance);
+    const gain =
+      startingBalance > 0
+        ? ((currentBalance - startingBalance) / startingBalance) * 100
+        : Number(account.gain) || 0;
+    const dd =
+      peakEquity > 0 ? ((peakEquity - lowestEquity) / peakEquity) * 100 : Number(account.dd) || 0;
+
+    const score =
+      contest.type === 'standard'
+        ? Number(entry.score) || 0
+        : calculateContestScore(gain, dd, account.profit, currentBalance, contest.scoring_mode);
+
+    await lbDoc.ref.set(
+      {
+        gain,
+        dd,
+        profit: Number(account.profit) || 0,
+        balance: currentBalance,
+        score,
+        peak_equity: peakEquity,
+        lowest_equity: lowestEquity,
+        score_updated_by: 'user_account_sync',
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+
+    const partSnap = await db
+      .collection(COLLECTIONS.contestParticipations)
+      .where('contest_id', '==', entry.contest_id)
+      .where('user_id', '==', entry.user_id)
+      .get();
+    const partBatch = db.batch();
+    partSnap.docs.forEach((partDoc) => {
+      partBatch.set(
+        partDoc.ref,
+        {
+          current_balance: currentBalance,
+          peak_equity: peakEquity,
+          lowest_equity: lowestEquity,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+    });
+    await partBatch.commit();
+
+    const maxDd = contest.max_dd_rule ?? contest.dd_cap;
+    if (maxDd && maxDd > 0 && dd >= maxDd) {
+      await lbDoc.ref.set(
+        { participant_status: 'disqualified', updatedAt: FieldValue.serverTimestamp() },
+        { merge: true },
+      );
+      partSnap.docs.forEach((partDoc) => {
+        partDoc.ref.set(
+          {
+            participant_status: 'disqualified',
+            disqualified_at: new Date().toISOString(),
+            disqualified_reason: 'Maximum drawdown exceeded',
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+      });
+    }
+
+    affectedContestIds.add(String(entry.contest_id));
+  }
+
+  for (const contestId of affectedContestIds) {
+    await updateContestRankingsServer(contestId);
+  }
+}
+
 async function updateContestRankingsServer(contestId, options = {}) {
   const { force = false } = options;
   const contestSnap = await db.collection(COLLECTIONS.contests).doc(contestId).get();
@@ -1841,8 +1971,12 @@ async function updateContestRankingsServer(contestId, options = {}) {
       await statusBatch.commit();
     }
   } else {
-    const active = deduped.filter((entry) => entry.participant_status !== 'disqualified');
-    const disqualified = deduped.filter((entry) => entry.participant_status === 'disqualified');
+    const active = deduped.filter(
+      (entry) => entry.participant_status !== 'disqualified' && entry.participant_status !== 'withdrawn',
+    );
+    const disqualified = deduped.filter(
+      (entry) => entry.participant_status === 'disqualified' || entry.participant_status === 'withdrawn',
+    );
     const sorted = [...active].sort((left, right) => {
       if ((Number(right.score) || 0) !== (Number(left.score) || 0)) {
         return (Number(right.score) || 0) - (Number(left.score) || 0);
@@ -3297,6 +3431,97 @@ app.post('/api/pft/backfill-leaderboard-meta', requireAdmin, async (_req, res) =
     });
   } catch (error) {
     res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to backfill PFT leaderboard metadata.' });
+  }
+});
+
+app.post('/api/contests/:contestId/try-auto-start', requireUser, async (req, res) => {
+  try {
+    const contestId = String(req.params.contestId || '').trim();
+    if (!contestId) {
+      res.status(400).json({ error: 'contestId is required.' });
+      return;
+    }
+    const result = await tryAutoStartContestPrivileged(db, contestId, notificationAdmin);
+    res.json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error instanceof Error ? error.message : 'Failed to auto-start contest.' });
+  }
+});
+
+app.get('/api/contests/:contestId/participations', requireUser, async (req, res) => {
+  try {
+    const contestId = String(req.params.contestId || '').trim();
+    const uid = req.firebaseUser.uid;
+    const userSnap = await db.collection(COLLECTIONS.users).doc(uid).get();
+    const participations = await listContestParticipations(db, contestId, uid, userSnap);
+    res.json({ participations });
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error instanceof Error ? error.message : 'Failed to list participations.' });
+  }
+});
+
+app.post('/api/contests/:contestId/rooms/:roomId/assign-teams', requireUser, async (req, res) => {
+  try {
+    const contestId = String(req.params.contestId || '').trim();
+    const roomId = String(req.params.roomId || '').trim();
+    const uid = req.firebaseUser.uid;
+    const userSnap = await db.collection(COLLECTIONS.users).doc(uid).get();
+    const result = await assignRandomTeams(db, contestId, roomId, uid, userSnap);
+    res.json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error instanceof Error ? error.message : 'Failed to assign teams.' });
+  }
+});
+
+app.post('/api/contests/:contestId/participants/:userId/remove', requireUser, async (req, res) => {
+  try {
+    const contestId = String(req.params.contestId || '').trim();
+    const targetUserId = String(req.params.userId || '').trim();
+    const mode = req.body?.mode === 'leaderboard_only' ? 'leaderboard_only' : 'full';
+    const reason = String(req.body?.reason || '');
+    if (!contestId || !targetUserId) {
+      res.status(400).json({ error: 'contestId and userId are required.' });
+      return;
+    }
+    const uid = req.firebaseUser.uid;
+    const userSnap = await db.collection(COLLECTIONS.users).doc(uid).get();
+    const result = await removeContestParticipantPrivileged(db, contestId, targetUserId, uid, userSnap, {
+      mode,
+      reason,
+      updateContestRankingsServer,
+      notifications: notificationAdmin,
+    });
+    res.json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error instanceof Error ? error.message : 'Failed to remove participant.' });
+  }
+});
+
+app.get('/api/users/lookup-by-email', requireUser, async (req, res) => {
+  try {
+    const email = String(req.query.email || '');
+    const uid = req.firebaseUser.uid;
+    const userSnap = await db.collection(COLLECTIONS.users).doc(uid).get();
+    const isAdmin = userSnap.exists && userSnap.data().role === 'admin';
+    const contestId = String(req.query.contestId || '').trim();
+    let allowed = isAdmin;
+    if (!allowed && contestId) {
+      const contestSnap = await db.collection(COLLECTIONS.contests).doc(contestId).get();
+      allowed = contestSnap.exists && contestSnap.data().creator_id === uid;
+    }
+    if (!allowed) {
+      res.status(403).json({ error: 'Only contest creators or admins can look up users by email.' });
+      return;
+    }
+    const result = await lookupUserByEmail(db, email);
+    res.json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error instanceof Error ? error.message : 'Lookup failed.' });
   }
 });
 
