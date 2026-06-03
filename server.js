@@ -434,14 +434,45 @@ function requireCronSecret(req, res, next) {
   next();
 }
 
-function resolveMetaApiTokenCandidates(account, settings) {
-  const candidates = [
-    account?.metaapi_token,
-    process.env.METAAPI_TOKEN,
-    settings?.metaapi_token,
-  ].filter(Boolean);
+function normalizeMetaApiToken(value) {
+  const t = typeof value === 'string' ? value.trim() : '';
+  return t.length > 0 ? t : null;
+}
 
-  return [...new Set(candidates)];
+function dedupeMetaApiTokens(tokens) {
+  return [...new Set(tokens.filter(Boolean))];
+}
+
+/** Admin Firestore token first, then METAAPI_TOKEN env (investor provisioning). */
+function resolvePlatformMetaApiTokenCandidates(settings) {
+  return dedupeMetaApiTokens([
+    normalizeMetaApiToken(settings?.metaapi_token),
+    normalizeMetaApiToken(process.env.METAAPI_TOKEN),
+  ]);
+}
+
+/** Per-account sync: linked account token, then platform settings, then env. */
+function resolveAccountMetaApiTokenCandidates(account, settings) {
+  return dedupeMetaApiTokens([
+    normalizeMetaApiToken(account?.metaapi_token),
+    normalizeMetaApiToken(settings?.metaapi_token),
+    normalizeMetaApiToken(process.env.METAAPI_TOKEN),
+  ]);
+}
+
+function resolveMetaApiTokenCandidates(account, settings) {
+  return resolveAccountMetaApiTokenCandidates(account, settings);
+}
+
+function mapMetaApiProvisionError(rawError) {
+  const msg = String(rawError || '');
+  if (/401|unauthorized|invalid auth-token/i.test(msg)) {
+    return (
+      'Invalid MetaApi API token on the server. Update the token in Admin → Settings ' +
+      '(or fix METAAPI_TOKEN in backend .env) and restart the backend.'
+    );
+  }
+  return msg || 'MetaApi account provisioning failed.';
 }
 
 function isMetaApiAuthError(error) {
@@ -3028,7 +3059,7 @@ app.post('/api/meta-api/provision-investor-account', requireUser, async (req, re
     }
 
     const settings = await getSiteSettings();
-    const tokenCandidates = resolveMetaApiTokenCandidates({}, settings);
+    const tokenCandidates = resolvePlatformMetaApiTokenCandidates(settings);
     if (tokenCandidates.length === 0) {
       res.status(503).json({
         error: 'MetaApi is not configured on the server. Set METAAPI_TOKEN or the MetaApi token in Admin Settings.',
@@ -3037,6 +3068,12 @@ app.post('/api/meta-api/provision-investor-account', requireUser, async (req, re
     }
 
     const apiToken = tokenCandidates[0];
+    const tokenSource =
+      normalizeMetaApiToken(settings?.metaapi_token) === apiToken ? 'firestore' : 'env';
+    if (process.env.NODE_ENV !== 'production') {
+      console.info('[MetaApi][provision-investor] token source:', tokenSource);
+    }
+
     const result = await provisionInvestorMetaApiAccount(apiToken, settings, {
       login,
       password,
@@ -3045,8 +3082,9 @@ app.post('/api/meta-api/provision-investor-account', requireUser, async (req, re
     });
 
     if (!result.success || !result.data) {
-      res.status(502).json({
-        error: result.error || 'MetaApi account provisioning failed.',
+      const status = /401|unauthorized|invalid auth-token/i.test(String(result.error || '')) ? 401 : 502;
+      res.status(status).json({
+        error: mapMetaApiProvisionError(result.error),
       });
       return;
     }
