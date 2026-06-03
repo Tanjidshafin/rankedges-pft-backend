@@ -28,6 +28,7 @@ const {
 } = require('./metaApiProvisioningFeatures');
 const { formatMetaApiHttpError } = require('./metaApiHttpErrors');
 const { assertMetaApiCloudAccountId } = require('./metaApiProvisioningId');
+const { provisionInvestorMetaApiAccount } = require('./metaApiProvisionInvestor');
 const {
   reportAccountSyncProgressThrottled,
   flushAccountThrottleNow,
@@ -261,6 +262,7 @@ const notificationAdmin = createNotificationAdmin(db, {
 });
 
 const SETTINGS_DOC_ID = 'site_settings';
+const PUBLIC_SETTINGS_DOC_ID = 'public_site_settings';
 
 function toIsoDate(value) {
   if (!value) return '';
@@ -316,8 +318,14 @@ function resolveTradingAccountPlatform(account, participant, snapshot) {
 }
 
 async function getSiteSettings() {
-  const snap = await db.collection(COLLECTIONS.settings).doc(SETTINGS_DOC_ID).get();
-  return snap.exists ? snap.data() : {};
+  const [legacySnap, publicSnap] = await Promise.all([
+    db.collection(COLLECTIONS.settings).doc(SETTINGS_DOC_ID).get(),
+    db.collection(COLLECTIONS.settings).doc(PUBLIC_SETTINGS_DOC_ID).get(),
+  ]);
+  return {
+    ...(publicSnap.exists ? publicSnap.data() : {}),
+    ...(legacySnap.exists ? legacySnap.data() : {}),
+  };
 }
 
 async function updateSiteSettings(partial) {
@@ -3002,6 +3010,58 @@ async function captureEndedBatchesInternal(requestedBy = 'cron') {
 
 app.get('/health', (_req, res) => {
   res.json({ ok: true, service: 'rankedges-pft-backend' });
+});
+
+/**
+ * Investor-password connect: provisions a MetaApi cloud account using the server token (never sent to the client settings API).
+ */
+app.post('/api/meta-api/provision-investor-account', requireUser, async (req, res) => {
+  try {
+    const login = String(req.body?.login || '').trim();
+    const password = String(req.body?.password || '').trim();
+    const server = String(req.body?.server || '').trim();
+    const platform = req.body?.platform === 'mt4' ? 'mt4' : 'mt5';
+
+    if (!login || !password || !server) {
+      res.status(400).json({ error: 'login, password, and server are required.' });
+      return;
+    }
+
+    const settings = await getSiteSettings();
+    const tokenCandidates = resolveMetaApiTokenCandidates({}, settings);
+    if (tokenCandidates.length === 0) {
+      res.status(503).json({
+        error: 'MetaApi is not configured on the server. Set METAAPI_TOKEN or the MetaApi token in Admin Settings.',
+      });
+      return;
+    }
+
+    const apiToken = tokenCandidates[0];
+    const result = await provisionInvestorMetaApiAccount(apiToken, settings, {
+      login,
+      password,
+      server,
+      platform,
+    });
+
+    if (!result.success || !result.data) {
+      res.status(502).json({
+        error: result.error || 'MetaApi account provisioning failed.',
+      });
+      return;
+    }
+
+    res.json({
+      ok: true,
+      accountId: result.data.accountId,
+      token: result.data.token,
+      region: result.data.region,
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'MetaApi provisioning failed.',
+    });
+  }
 });
 
 /**
