@@ -52,15 +52,86 @@ function getMetaStatsApiUrl(region) {
 }
 
 /**
- * MetaStats return-style ratios (gain, absoluteGain, dailyGain, monthlyGain).
- * Docs example: absoluteGain ~1.12 → 112% display. Live API often returns values already in % (e.g. -76.99).
+ * MetaStats compound daily/monthly rate of return (dailyGain, monthlyGain, dailyGrowth gains).
+ * Docs: decimal rate where 0.023 → 2.3%. Live API may also send values already in % (e.g. 12.12).
  */
-function ratioToPercentDisplay(value) {
+function compoundRateToPercent(value, fractionDigits = 2) {
   if (value === null || value === undefined) return null;
   const n = Number(value);
   if (!Number.isFinite(n)) return null;
-  if (Math.abs(n) <= 2 && n !== 0) return Number((n * 100).toFixed(2));
-  return Number(n.toFixed(2));
+  if (n === 0) return 0;
+
+  const abs = Math.abs(n);
+  let result;
+  if (abs < 1) {
+    result = n * 100;
+  } else if (abs >= 2) {
+    result = n;
+  } else {
+    console.warn(
+      '[MetaStats][compoundRateToPercent] value in 1..2 range treated as multiplier offset',
+      { value: n },
+    );
+    result = n >= 0 ? (n - 1) * 100 : (n + 1) * 100;
+  }
+  return Number(result.toFixed(fractionDigits));
+}
+
+/**
+ * dailyGain can arrive in a different scale than gain/monthlyGain/absoluteGain on the same payload.
+ * When headline gain fields cluster around monthlyGain (percent mode) but dailyGain sits in 1..2
+ * and would have been inflated by legacy ratio*100, align daily with monthly for short-history accounts.
+ */
+function resolveDailyGainPercent(raw, fractionDigits = 2) {
+  const dailyMapped = compoundRateToPercent(raw.dailyGain, fractionDigits);
+  const monthly = Number(raw.monthlyGain);
+  const gain = Number(raw.gain);
+  const absGain = Number(raw.absoluteGain);
+  const dailyRaw = Number(raw.dailyGain);
+  const days = Number(raw.daysSinceTradingStarted);
+
+  if (!Number.isFinite(dailyRaw) || !Number.isFinite(monthly) || Math.abs(monthly) < 2) {
+    return dailyMapped;
+  }
+  if (Math.abs(dailyRaw) < 1 || Math.abs(dailyRaw) >= 2) {
+    return dailyMapped;
+  }
+
+  const clustered =
+    [monthly, gain, absGain].filter(Number.isFinite).length >= 2 &&
+    [gain, absGain]
+      .filter(Number.isFinite)
+      .every((v) => Math.abs(v - monthly) < 0.5);
+  const shortHistory = Number.isFinite(days) && days < 1;
+  const legacyInflated = Math.abs(dailyRaw * 100) > Math.abs(monthly) * 2;
+
+  if (clustered && legacyInflated && shortHistory) {
+    console.warn('[MetaStats][dailyGain] reconciled with monthlyGain for short-history account', {
+      dailyGain: dailyRaw,
+      monthlyGain: monthly,
+      daysSinceTradingStarted: days,
+    });
+    return compoundRateToPercent(monthly, fractionDigits);
+  }
+
+  return dailyMapped;
+}
+
+/**
+ * MetaStats gain / absoluteGain multiplier-style ratios.
+ * Docs example: absoluteGain ~1.12 → 112% display. Live API often returns values already in % (e.g. -76.99).
+ */
+function gainMultiplierToPercent(value, fractionDigits = 2) {
+  if (value === null || value === undefined) return null;
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  if (Math.abs(n) <= 2 && n !== 0) return Number((n * 100).toFixed(fractionDigits));
+  return Number(n.toFixed(fractionDigits));
+}
+
+/** @deprecated Use compoundRateToPercent or gainMultiplierToPercent */
+function ratioToPercentDisplay(value) {
+  return gainMultiplierToPercent(value, 2);
 }
 
 /** API body is `{ metrics: { ... } }` (200) or flat metrics on 202 poll payloads. */
@@ -73,11 +144,7 @@ function unwrapMetaStatsMetricsBody(body) {
 const DEFAULT_DAILY_GROWTH_MAX_POINTS = 2000;
 
 function percentForChart(value) {
-  if (value === null || value === undefined) return null;
-  const n = Number(value);
-  if (!Number.isFinite(n)) return null;
-  if (Math.abs(n) <= 2 && n !== 0) return Number((n * 100).toFixed(4));
-  return Number(n.toFixed(4));
+  return compoundRateToPercent(value, 4);
 }
 
 /**
@@ -300,10 +367,10 @@ function mapMetaStatsToAccountMetrics(body) {
   }
 
   const mapped = {
-    gain: ratioToPercentDisplay(raw.gain),
-    metaapi_abs_gain: ratioToPercentDisplay(raw.absoluteGain),
-    metaapi_daily_gain: ratioToPercentDisplay(raw.dailyGain),
-    metaapi_monthly_gain: ratioToPercentDisplay(raw.monthlyGain),
+    gain: gainMultiplierToPercent(raw.gain),
+    metaapi_abs_gain: gainMultiplierToPercent(raw.absoluteGain),
+    metaapi_daily_gain: resolveDailyGainPercent(raw),
+    metaapi_monthly_gain: compoundRateToPercent(raw.monthlyGain),
     dd: resolveMaxDrawdownPercent(raw),
     profit: coerceNumber(raw.profit),
     balance: coerceNumber(raw.balance),
@@ -387,6 +454,9 @@ module.exports = {
   MetaStatsFetchError,
   safeJsonSnippet,
   getMetaStatsApiUrl,
+  compoundRateToPercent,
+  gainMultiplierToPercent,
+  resolveDailyGainPercent,
   ratioToPercentDisplay,
   /** @deprecated alias — plan name */
   ratioToPercent: ratioToPercentDisplay,
