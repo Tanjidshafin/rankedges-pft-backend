@@ -100,6 +100,7 @@ const notificationTypeToPreferenceKey = {
   global_rank_change: 'globalLeaderboard',
   pft_participant_status: 'pftUpdates',
   admin_access_updated: 'adminAccessUpdates',
+  phone_number_reminder: 'complianceAlerts',
 };
 
 /**

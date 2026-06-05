@@ -1709,7 +1709,16 @@ function mapBatchStatusToContestStatus(batchStatus) {
   }
 }
 
-async function createContestForPftBatch(batchId, batchData, createdBy) {
+function isPftContestDoc(contest) {
+  if (!contest) return false;
+  if (contest.type === 'pft') return true;
+  if (contest.pft_batch_id) return true;
+  if (contest.pft_batch_number != null) return true;
+  if (contest.enrollment_mode === 'admin_only' && /pft/i.test(contest.name || '')) return true;
+  return false;
+}
+
+function buildContestPayloadForPftBatch(batchId, batchData, createdBy) {
   const batchStatus = String(batchData.status || 'scheduled');
   const contestStatus = mapBatchStatusToContestStatus(batchStatus);
   const contestPayload = {
@@ -1735,7 +1744,6 @@ async function createContestForPftBatch(batchId, batchData, createdBy) {
     start_mode: 'scheduled',
     availability: 'public',
     access_type: 'open',
-    createdAt: FieldValue.serverTimestamp(),
     updatedAt: FieldValue.serverTimestamp(),
   };
 
@@ -1749,8 +1757,34 @@ async function createContestForPftBatch(batchId, batchData, createdBy) {
     contestPayload.completed_at = batchData.completedAt || batchData.endAt;
   }
 
+  return contestPayload;
+}
+
+async function createContestForPftBatch(batchId, batchData, createdBy) {
+  const contestPayload = {
+    ...buildContestPayloadForPftBatch(batchId, batchData, createdBy),
+    createdAt: FieldValue.serverTimestamp(),
+  };
   const contestRef = await db.collection(COLLECTIONS.contests).add(contestPayload);
   return contestRef.id;
+}
+
+async function ensureContestDocForBatch(batchId, batchData, contestId, createdBy = 'sync') {
+  if (!batchId || !contestId) return { repaired: false, contestId };
+
+  const contestSnap = await db.collection(COLLECTIONS.contests).doc(contestId).get();
+  const contest = contestSnap.exists ? contestSnap.data() : null;
+
+  if (!contestSnap.exists || !isPftContestDoc(contest)) {
+    const payload = buildContestPayloadForPftBatch(batchId, batchData, createdBy);
+    if (!contestSnap.exists) {
+      payload.createdAt = FieldValue.serverTimestamp();
+    }
+    await db.collection(COLLECTIONS.contests).doc(contestId).set(payload, { merge: true });
+    return { repaired: true, contestId };
+  }
+
+  return { repaired: false, contestId };
 }
 
 async function ensureBatchHasContest(batchId, batchData, createdBy) {
@@ -1761,10 +1795,147 @@ async function ensureBatchHasContest(batchId, batchData, createdBy) {
       contestId,
       updatedAt: FieldValue.serverTimestamp(),
     }, { merge: true });
+  } else {
+    await ensureContestDocForBatch(batchId, batchData, contestId, createdBy || batchData.createdBy || 'sync');
   }
 
   await syncPftBatchContestLeaderboard(batchId, contestId);
   return contestId;
+}
+
+const PFT_BATCH_DELETABLE_STATUSES = new Set(['completed', 'capturing', 'archived']);
+
+async function deleteContestDataById(contestId) {
+  if (!contestId) {
+    return {
+      contestId: null,
+      payouts: 0,
+      leaderboard: 0,
+      participations: 0,
+      contestDeleted: false,
+    };
+  }
+
+  const [payouts, leaderboard, participations] = await Promise.all([
+    deleteDocumentsByField(COLLECTIONS.prizePayouts, 'contest_id', contestId),
+    deleteDocumentsByField(COLLECTIONS.leaderboard, 'contest_id', contestId),
+    deleteDocumentsByField(COLLECTIONS.contestParticipations, 'contest_id', contestId),
+  ]);
+
+  const contestRef = db.collection(COLLECTIONS.contests).doc(contestId);
+  const contestSnap = await contestRef.get();
+  if (contestSnap.exists) {
+    await contestRef.delete();
+  }
+
+  return {
+    contestId,
+    payouts,
+    leaderboard,
+    participations,
+    contestDeleted: contestSnap.exists,
+  };
+}
+
+async function deletePftBatchDataById(batchId) {
+  if (!batchId) {
+    return {
+      batchId: null,
+      participants: 0,
+      snapshots: 0,
+      jobs: 0,
+      batchDeleted: false,
+    };
+  }
+
+  const [participants, snapshots, jobs] = await Promise.all([
+    deleteDocumentsByField(COLLECTIONS.participants, 'batchId', batchId),
+    deleteDocumentsByField(COLLECTIONS.snapshots, 'batchId', batchId),
+    deleteDocumentsByField(COLLECTIONS.jobs, 'batchId', batchId),
+  ]);
+
+  const batchRef = db.collection(COLLECTIONS.batches).doc(batchId);
+  const batchSnap = await batchRef.get();
+  if (batchSnap.exists) {
+    await batchRef.delete();
+  }
+
+  return {
+    batchId,
+    participants,
+    snapshots,
+    jobs,
+    batchDeleted: batchSnap.exists,
+  };
+}
+
+async function resolveBatchIdForContest(contestId, contestDoc) {
+  if (!contestId) return null;
+
+  const byContestIdSnap = await db.collection(COLLECTIONS.batches).where('contestId', '==', contestId).limit(1).get();
+  if (!byContestIdSnap.empty) {
+    return byContestIdSnap.docs[0].id;
+  }
+
+  const pftBatchId = contestDoc?.pft_batch_id;
+  if (pftBatchId) {
+    const batchSnap = await db.collection(COLLECTIONS.batches).doc(String(pftBatchId)).get();
+    if (batchSnap.exists) {
+      return batchSnap.id;
+    }
+  }
+
+  return null;
+}
+
+async function deletePftBatchCascade(batchId, options = {}) {
+  const batchSnap = await db.collection(COLLECTIONS.batches).doc(batchId).get();
+  if (!batchSnap.exists) {
+    throw new Error('PFT batch not found.');
+  }
+
+  const batchData = batchSnap.data();
+  const batchStatus = String(batchData.status || 'scheduled');
+  if (!options.force && !PFT_BATCH_DELETABLE_STATUSES.has(batchStatus)) {
+    throw new Error('Only completed, capturing, or archived PFT batches can be deleted.');
+  }
+
+  const contestId = batchData.contestId || null;
+  const batchResult = await deletePftBatchDataById(batchId);
+  const contestResult = contestId ? await deleteContestDataById(contestId) : null;
+
+  return {
+    ok: true,
+    batchId,
+    contestId,
+    batchStatus,
+    ...batchResult,
+    contest: contestResult,
+  };
+}
+
+async function deletePftByContestId(contestId) {
+  const contestSnap = await db.collection(COLLECTIONS.contests).doc(contestId).get();
+  if (!contestSnap.exists) {
+    throw new Error('Contest not found.');
+  }
+
+  const contest = contestSnap.data();
+  if (!isPftContestDoc(contest)) {
+    throw new Error('Contest is not a PFT-linked contest.');
+  }
+
+  const batchId = await resolveBatchIdForContest(contestId, contest);
+  const batchResult = batchId ? await deletePftBatchDataById(batchId) : null;
+  const contestResult = await deleteContestDataById(contestId);
+
+  return {
+    ok: true,
+    batchId,
+    contestId,
+    batch: batchResult,
+    contest: contestResult,
+  };
 }
 
 async function syncContestStatusFromBatch(batchId, batchData) {
@@ -2300,14 +2471,25 @@ async function syncPftBatchContestLeaderboard(batchId, contestId) {
     return { enrolled: 0, metaUpdated: 0, participants: 0, metricsUpdated: 0 };
   }
 
-  const [participants, batchSnap, contestSnap] = await Promise.all([
+  const batchSnap = await db.collection(COLLECTIONS.batches).doc(batchId).get();
+  const batchData = batchSnap.exists ? { id: batchSnap.id, ...batchSnap.data() } : { id: batchId };
+
+  await ensureContestDocForBatch(
+    batchId,
+    batchData,
+    contestId,
+    batchData.createdBy || 'sync',
+  );
+
+  const [participants, contestSnap] = await Promise.all([
     listBatchParticipants(batchId),
-    db.collection(COLLECTIONS.batches).doc(batchId).get(),
     db.collection(COLLECTIONS.contests).doc(contestId).get(),
   ]);
 
-  const batchData = batchSnap.exists ? { id: batchSnap.id, ...batchSnap.data() } : { id: batchId };
-  const contest = contestSnap.exists ? contestSnap.data() : null;
+  if (!contestSnap.exists || !isPftContestDoc(contestSnap.data())) {
+    return { enrolled: 0, metaUpdated: 0, participants: 0, metricsUpdated: 0, skipped: true };
+  }
+
   const batchStatus = String(batchData.status || '');
   let enrolled = 0;
 
@@ -2440,6 +2622,11 @@ async function recomputeAllPftContestRankings(adminId) {
 async function finalizeContestFromSnapshots(batchId, batchData, adminId) {
   const contestId = batchData.contestId;
   if (!contestId) return;
+
+  const contestSnap = await db.collection(COLLECTIONS.contests).doc(contestId).get();
+  if (!contestSnap.exists || !isPftContestDoc(contestSnap.data())) {
+    return;
+  }
 
   const [snapshots, participants] = await Promise.all([
     listBatchSnapshots(batchId),
@@ -3466,6 +3653,28 @@ app.post('/api/pft/batches/:batchId/reprocess', requireAdmin, async (req, res) =
     res.json(result);
   } catch (error) {
     res.status(500).json({ error: error instanceof Error ? error.message : 'Failed to reprocess batch.' });
+  }
+});
+
+app.delete('/api/pft/batches/:batchId', requireAdmin, async (req, res) => {
+  try {
+    const result = await deletePftBatchCascade(req.params.batchId);
+    res.json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to delete PFT batch.';
+    const status = /not found|can be deleted/i.test(message) ? 400 : 500;
+    res.status(status).json({ error: message });
+  }
+});
+
+app.delete('/api/pft/contests/:contestId', requireAdmin, async (req, res) => {
+  try {
+    const result = await deletePftByContestId(req.params.contestId);
+    res.json(result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Failed to delete PFT contest.';
+    const status = /not found|not a PFT/i.test(message) ? 400 : 500;
+    res.status(status).json({ error: message });
   }
 });
 
