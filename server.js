@@ -26,7 +26,7 @@ const {
   deployProvisioningAccount,
   waitForProvisioningDeployed,
 } = require('./metaApiProvisioningFeatures');
-const { formatMetaApiHttpError } = require('./metaApiHttpErrors');
+const { buildLeaderboardMetricUpdate } = require('./contestGainMetrics');
 const { assertMetaApiCloudAccountId } = require('./metaApiProvisioningId');
 const { provisionInvestorMetaApiAccount } = require('./metaApiProvisionInvestor');
 const {
@@ -2016,7 +2016,6 @@ async function syncAccountToContestData(accountId) {
   const accountSnap = await db.collection(COLLECTIONS.accounts).doc(String(accountId)).get();
   if (!accountSnap.exists) return;
   const account = { id: accountSnap.id, ...accountSnap.data() };
-  const currentBalance = Number(account.balance) || 0;
 
   const lbSnap = await db.collection(COLLECTIONS.leaderboard).where('account_id', '==', String(accountId)).get();
   const affectedContestIds = new Set();
@@ -2035,29 +2034,32 @@ async function syncAccountToContestData(accountId) {
     if (contest.rankings_locked) continue;
 
     const startingBalance = Number(entry.starting_balance) || 0;
-    const peakEquity = Math.max(Number(entry.peak_equity) || currentBalance, currentBalance);
-    const lowestEquity = Math.min(Number(entry.lowest_equity) || currentBalance, currentBalance);
-    const gain =
-      startingBalance > 0
-        ? ((currentBalance - startingBalance) / startingBalance) * 100
-        : Number(account.gain) || 0;
-    const dd =
-      peakEquity > 0 ? ((peakEquity - lowestEquity) / peakEquity) * 100 : Number(account.dd) || 0;
+    const metrics = buildLeaderboardMetricUpdate({
+      contest,
+      account,
+      entry: {
+        starting_balance: startingBalance,
+        starting_equity: entry.starting_equity,
+        peak_equity: entry.peak_equity,
+        lowest_equity: entry.lowest_equity,
+      },
+    });
 
     const score =
       contest.type === 'standard'
         ? Number(entry.score) || 0
-        : calculateContestScore(gain, dd, account.profit, currentBalance, contest.scoring_mode);
+        : calculateContestScore(metrics.gain, metrics.dd, metrics.profit, metrics.balance, contest.scoring_mode);
 
     await lbDoc.ref.set(
       {
-        gain,
-        dd,
-        profit: Number(account.profit) || 0,
-        balance: currentBalance,
+        gain: metrics.gain,
+        dd: metrics.dd,
+        profit: metrics.profit,
+        balance: metrics.balance,
+        equity: metrics.equity,
         score,
-        peak_equity: peakEquity,
-        lowest_equity: lowestEquity,
+        peak_equity: metrics.peak_equity,
+        lowest_equity: metrics.lowest_equity,
         score_updated_by: 'user_account_sync',
         updatedAt: FieldValue.serverTimestamp(),
       },
@@ -2074,9 +2076,10 @@ async function syncAccountToContestData(accountId) {
       partBatch.set(
         partDoc.ref,
         {
-          current_balance: currentBalance,
-          peak_equity: peakEquity,
-          lowest_equity: lowestEquity,
+          current_balance: metrics.balance,
+          current_equity: metrics.equity,
+          peak_equity: metrics.peak_equity,
+          lowest_equity: metrics.lowest_equity,
           updatedAt: FieldValue.serverTimestamp(),
         },
         { merge: true },
@@ -2085,7 +2088,7 @@ async function syncAccountToContestData(accountId) {
     await partBatch.commit();
 
     const maxDd = contest.max_dd_rule ?? contest.dd_cap;
-    if (maxDd && maxDd > 0 && dd >= maxDd) {
+    if (maxDd && maxDd > 0 && metrics.dd >= maxDd) {
       await lbDoc.ref.set(
         { participant_status: 'disqualified', updatedAt: FieldValue.serverTimestamp() },
         { merge: true },
