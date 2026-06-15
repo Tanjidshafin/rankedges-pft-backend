@@ -48,6 +48,10 @@ const {
   removeContestParticipantPrivileged,
 } = require('./contestPrivileged');
 const {
+  createProvisionedUser,
+  verifyProvisionedSession,
+} = require('./userProvisioning');
+const {
   mapPftParticipantStatusToContest,
   rankPftLeaderboardEntries,
   buildPftLeaderboardFields,
@@ -3832,6 +3836,31 @@ app.get('/api/users/lookup-by-email', requireUser, async (req, res) => {
   } catch (error) {
     const status = error.status || 500;
     res.status(status).json({ error: error instanceof Error ? error.message : 'Lookup failed.' });
+  }
+});
+
+app.post('/api/admin/users', requireAdminPermission('users'), async (req, res) => {
+  try {
+    const result = await createProvisionedUser(admin, db, req.body || {}, req.user.uid, {
+      usersCollection: COLLECTIONS.users,
+      FieldValue,
+    });
+    res.status(201).json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error instanceof Error ? error.message : 'Failed to create user.' });
+  }
+});
+
+app.post('/api/auth/verify-session', requireUser, async (req, res) => {
+  try {
+    const result = await verifyProvisionedSession(admin, db, req.firebaseUser, {
+      usersCollection: COLLECTIONS.users,
+    });
+    res.json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error instanceof Error ? error.message : 'Session verification failed.' });
   }
 });
 
