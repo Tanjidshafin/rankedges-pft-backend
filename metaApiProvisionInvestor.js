@@ -2,7 +2,11 @@
  * Server-side MetaApi investor-password provisioning (uses site METAAPI token; never exposed to the browser).
  */
 const crypto = require('crypto');
-const { formatMetaApiHttpError } = require('./metaApiHttpErrors');
+const {
+  extractRecommendedResourceSlots,
+  isResourceSlotsProvisioningError,
+  formatMetaApiHttpErrorFromBody,
+} = require('./metaApiHttpErrors');
 const {
   normalizeMetaApiProvisioningAccountId,
   metaApiLoginVsUuidMessage,
@@ -11,6 +15,9 @@ const {
 const PROVISIONING_API_BASE =
   process.env.META_API_PROVISIONING_BASE ||
   'https://mt-provisioning-api-v1.agiliumtrade.agiliumtrade.ai';
+
+const MAX_RESOURCE_SLOTS = 10;
+const MAX_RESOURCE_SLOT_RETRIES = 3;
 
 function provisioningTransactionId() {
   return crypto.randomBytes(16).toString('hex');
@@ -22,6 +29,81 @@ function provisioningOptionsFromSiteSettings(settings) {
   const raw = settings?.metaapi_provisioning_region;
   const region = typeof raw === 'string' && raw.trim() ? raw.trim() : 'new-york';
   return { reliability, cloudType, region };
+}
+
+function resolveDefaultResourceSlots(settings) {
+  const fromSettings = Number(settings?.metaapi_provisioning_resource_slots);
+  if (Number.isFinite(fromSettings) && fromSettings >= 1) {
+    return Math.min(Math.trunc(fromSettings), MAX_RESOURCE_SLOTS);
+  }
+  const fromEnv = Number(process.env.METAAPI_PROVISIONING_RESOURCE_SLOTS);
+  if (Number.isFinite(fromEnv) && fromEnv >= 1) {
+    return Math.min(Math.trunc(fromEnv), MAX_RESOURCE_SLOTS);
+  }
+  return 1;
+}
+
+function buildProvisioningCreateBody(params) {
+  const {
+    login,
+    password,
+    server,
+    platform,
+    reliability,
+    cloudType,
+    provisioningRegion,
+    resourceSlots,
+  } = params;
+
+  return {
+    login,
+    password,
+    name: `${login}@${server}`,
+    server,
+    platform,
+    magic: 0,
+    quoteStreamingIntervalInSeconds: 2.5,
+    application: 'MetaApi',
+    type: cloudType,
+    reliability,
+    region: provisioningRegion,
+    resourceSlots,
+    metastatsApiEnabled: true,
+  };
+}
+
+async function parseProvisioningFailure(response) {
+  const status = response.status;
+  let rawText = '';
+
+  try {
+    rawText = await response.text();
+  } catch {
+    rawText = '';
+  }
+
+  let parsed = null;
+  if (rawText && rawText.trim()) {
+    try {
+      parsed = JSON.parse(rawText.trim());
+    } catch {
+      parsed = null;
+    }
+  }
+
+  const message = formatMetaApiHttpErrorFromBody(
+    'provision-investor-account',
+    status,
+    response.statusText || '',
+    parsed,
+    rawText,
+  );
+
+  return {
+    message,
+    isResourceSlotsError: isResourceSlotsProvisioningError(status, parsed),
+    recommendedResourceSlots: extractRecommendedResourceSlots(parsed),
+  };
 }
 
 async function listProvisioningAccounts(token) {
@@ -46,38 +128,25 @@ async function resolveMetaApiCloudAccountId(token, createPayload, login) {
   return match ? normalizeMetaApiProvisioningAccountId(match.id) : null;
 }
 
+async function postProvisioningAccount(apiToken, transactionId, createBody) {
+  return fetch(`${PROVISIONING_API_BASE}/users/current/accounts`, {
+    method: 'POST',
+    headers: {
+      'auth-token': apiToken,
+      'Content-Type': 'application/json',
+      'transaction-id': transactionId,
+    },
+    body: JSON.stringify(createBody),
+  });
+}
+
 async function waitForProvisioningCreateResult(
   initialResponse,
   transactionId,
   apiToken,
   login,
-  password,
-  server,
-  platform,
-  reliability,
-  cloudType,
-  provisioningRegion,
+  createBody,
 ) {
-  const createBody = {
-    login,
-    password,
-    name: `${login}@${server}`,
-    server,
-    platform,
-    magic: 0,
-    quoteStreamingIntervalInSeconds: 2.5,
-    application: 'MetaApi',
-    type: cloudType,
-    reliability,
-    region: provisioningRegion,
-    metastatsApiEnabled: true,
-  };
-  const createHeaders = {
-    'auth-token': apiToken,
-    'Content-Type': 'application/json',
-    'transaction-id': transactionId,
-  };
-
   let response = initialResponse;
   const deadline = Date.now() + 180_000;
 
@@ -96,17 +165,18 @@ async function waitForProvisioningCreateResult(
         }
       }
       await new Promise((resolve) => setTimeout(resolve, waitMs));
-      response = await fetch(`${PROVISIONING_API_BASE}/users/current/accounts`, {
-        method: 'POST',
-        headers: createHeaders,
-        body: JSON.stringify(createBody),
-      });
+      response = await postProvisioningAccount(apiToken, transactionId, createBody);
       continue;
     }
 
     if (!response.ok) {
-      const message = await formatMetaApiHttpError('provision-investor-account', response);
-      return { success: false, error: message };
+      const failure = await parseProvisioningFailure(response);
+      return {
+        success: false,
+        error: failure.message,
+        isResourceSlotsError: failure.isResourceSlotsError,
+        recommendedResourceSlots: failure.recommendedResourceSlots,
+      };
     }
 
     const data = await response.json();
@@ -123,7 +193,9 @@ async function waitForProvisioningCreateResult(
       data: {
         accountId,
         token: apiToken,
-        region: typeof data.region === 'string' && data.region.trim() ? data.region : provisioningRegion,
+        region:
+          typeof data.region === 'string' && data.region.trim() ? data.region : createBody.region,
+        resourceSlots: createBody.resourceSlots,
       },
     };
   }
@@ -142,43 +214,73 @@ async function waitForProvisioningCreateResult(
 async function provisionInvestorMetaApiAccount(apiToken, settings, params) {
   const { login, password, server, platform } = params;
   const { reliability, cloudType, region: provisioningRegion } = provisioningOptionsFromSiteSettings(settings);
-  const transactionId = provisioningTransactionId();
+  let resourceSlots = resolveDefaultResourceSlots(settings);
 
-  const response = await fetch(`${PROVISIONING_API_BASE}/users/current/accounts`, {
-    method: 'POST',
-    headers: {
-      'auth-token': apiToken,
-      'Content-Type': 'application/json',
-      'transaction-id': transactionId,
-    },
-    body: JSON.stringify({
+  for (let slotAttempt = 0; slotAttempt < MAX_RESOURCE_SLOT_RETRIES; slotAttempt += 1) {
+    const createBody = buildProvisioningCreateBody({
       login,
       password,
-      name: `${login}@${server}`,
       server,
       platform,
-      magic: 0,
-      quoteStreamingIntervalInSeconds: 2.5,
-      application: 'MetaApi',
-      type: cloudType,
       reliability,
-      region: provisioningRegion,
-      metastatsApiEnabled: true,
-    }),
-  });
+      cloudType,
+      provisioningRegion,
+      resourceSlots,
+    });
+    const transactionId = provisioningTransactionId();
 
-  return waitForProvisioningCreateResult(
-    response,
-    transactionId,
-    apiToken,
-    login,
-    password,
-    server,
-    platform,
-    reliability,
-    cloudType,
-    provisioningRegion,
-  );
+    if (slotAttempt > 0) {
+      console.info(
+        `[MetaApi][provision-investor] retry ${slotAttempt + 1}/${MAX_RESOURCE_SLOT_RETRIES} with resourceSlots=${resourceSlots}`,
+      );
+    }
+
+    const response = await postProvisioningAccount(apiToken, transactionId, createBody);
+    const result = await waitForProvisioningCreateResult(
+      response,
+      transactionId,
+      apiToken,
+      login,
+      createBody,
+    );
+
+    if (result.success) {
+      if (resourceSlots > 1) {
+        console.info(
+          `[MetaApi][provision-investor] account created with resourceSlots=${resourceSlots}`,
+        );
+      }
+      return result;
+    }
+
+    const recommended = result.recommendedResourceSlots;
+    if (
+      result.isResourceSlotsError &&
+      recommended != null &&
+      recommended > resourceSlots &&
+      slotAttempt < MAX_RESOURCE_SLOT_RETRIES - 1
+    ) {
+      console.warn(
+        `[MetaApi][provision-investor] E_RESOURCE_SLOTS — MetaApi recommends ${recommended} slots (had ${resourceSlots})`,
+      );
+      resourceSlots = Math.min(recommended, MAX_RESOURCE_SLOTS);
+      continue;
+    }
+
+    return result;
+  }
+
+  return {
+    success: false,
+    error:
+      'MetaApi requires more resource slots for this broker account than we could allocate. Check MetaApi billing or contact support.',
+  };
 }
 
-module.exports = { provisionInvestorMetaApiAccount, provisioningOptionsFromSiteSettings };
+module.exports = {
+  provisionInvestorMetaApiAccount,
+  provisioningOptionsFromSiteSettings,
+  resolveDefaultResourceSlots,
+  buildProvisioningCreateBody,
+  MAX_RESOURCE_SLOTS,
+};

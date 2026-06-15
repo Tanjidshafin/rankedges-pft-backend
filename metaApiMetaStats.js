@@ -4,6 +4,19 @@
 
 const LOG_CAP = 8000;
 
+/** First MetaStats build on busy brokers often exceeds 3 minutes (HTTP 202 polling). */
+const DEFAULT_METASTATS_POLL_MAX_MS = 10 * 60 * 1000;
+const MIN_METASTATS_POLL_MAX_MS = 60 * 1000;
+const MAX_METASTATS_POLL_MAX_MS = 20 * 60 * 1000;
+
+function resolveMetastatsPollMaxMs() {
+  const raw = Number(process.env.METASTATS_POLL_MAX_MS);
+  if (Number.isFinite(raw) && raw >= MIN_METASTATS_POLL_MAX_MS) {
+    return Math.min(raw, MAX_METASTATS_POLL_MAX_MS);
+  }
+  return DEFAULT_METASTATS_POLL_MAX_MS;
+}
+
 class MetaStatsFetchError extends Error {
   /**
    * @param {number} status HTTP status code
@@ -472,7 +485,7 @@ async function fetchMetaStatsMetrics(metaApiAccountId, token, region, opts = {})
   const url = `${base}/users/current/accounts/${encodeURIComponent(metaApiAccountId)}/metrics${qp}`;
 
   const started = Date.now();
-  const maxMs = Number(process.env.METASTATS_POLL_MAX_MS || 180 * 1000);
+  const maxMs = resolveMetastatsPollMaxMs();
   let attempt = 0;
 
   while (Date.now() - started < maxMs) {
@@ -493,6 +506,13 @@ async function fetchMetaStatsMetrics(metaApiAccountId, token, region, opts = {})
     }
 
     if (response.status === 202) {
+      const elapsedSec = Math.round((Date.now() - started) / 1000);
+      const maxSec = Math.round(maxMs / 1000);
+      if (attempt === 0 || attempt % 4 === 0) {
+        console.log(
+          `[MetaStats][poll] metrics still building… ${elapsedSec}s / ${maxSec}s (${region})`,
+        );
+      }
       console.log('[MetaStats][raw]', `status=${response.status}`, safeJsonSnippet(bodySnippet));
       const secs =
         parseRetryAfterSeconds(response) ?? Math.min(20, Math.max(2, 2 ** Math.min(attempt, 5)));
@@ -522,6 +542,8 @@ async function fetchMetaStatsMetrics(metaApiAccountId, token, region, opts = {})
 
 module.exports = {
   LOG_CAP,
+  DEFAULT_METASTATS_POLL_MAX_MS,
+  resolveMetastatsPollMaxMs,
   MetaStatsFetchError,
   safeJsonSnippet,
   getMetaStatsApiUrl,

@@ -85,7 +85,7 @@ async function getProvisioningPayload(metaApiAccountId, authToken) {
  * @param {{ timeoutMs?: number; pollMs?: number }} opts
  */
 async function waitForProvisioningDeployed(metaApiAccountId, authToken, opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? Number(process.env.METAAPI_DEPLOY_POLL_MAX_MS || 120000);
+  const timeoutMs = opts.timeoutMs ?? Number(process.env.METAAPI_DEPLOY_POLL_MAX_MS || 300000);
   const pollMs = opts.pollMs ?? 3000;
   const deadline = Date.now() + timeoutMs;
 

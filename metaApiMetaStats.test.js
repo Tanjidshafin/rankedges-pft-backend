@@ -1,4 +1,4 @@
-const { describe, it } = require('node:test');
+const { describe, it, afterEach } = require('node:test');
 const assert = require('node:assert/strict');
 const {
   compoundRateToPercent,
@@ -7,6 +7,8 @@ const {
   deriveAbsoluteGainPercent,
   mapMetaStatsToAccountMetrics,
   normalizeDailyGrowthSeries,
+  resolveMetastatsPollMaxMs,
+  DEFAULT_METASTATS_POLL_MAX_MS,
 } = require('./metaApiMetaStats');
 
 describe('compoundRateToPercent', () => {
@@ -250,5 +252,25 @@ describe('normalizeDailyGrowthSeries', () => {
 
     assert.equal(series[0].totalGains, 12.23);
     assert.equal(series[0].gains, 12.23);
+  });
+});
+
+describe('resolveMetastatsPollMaxMs', () => {
+  const original = process.env.METASTATS_POLL_MAX_MS;
+
+  afterEach(() => {
+    if (original === undefined) delete process.env.METASTATS_POLL_MAX_MS;
+    else process.env.METASTATS_POLL_MAX_MS = original;
+  });
+
+  it('defaults to 10 minutes', () => {
+    delete process.env.METASTATS_POLL_MAX_MS;
+    assert.equal(resolveMetastatsPollMaxMs(), DEFAULT_METASTATS_POLL_MAX_MS);
+    assert.equal(DEFAULT_METASTATS_POLL_MAX_MS, 10 * 60 * 1000);
+  });
+
+  it('respects METASTATS_POLL_MAX_MS env override', () => {
+    process.env.METASTATS_POLL_MAX_MS = '900000';
+    assert.equal(resolveMetastatsPollMaxMs(), 900000);
   });
 });

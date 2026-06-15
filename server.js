@@ -496,6 +496,12 @@ function mapMetaApiProvisionError(rawError) {
       '(or fix METAAPI_TOKEN in backend .env) and restart the backend.'
     );
   }
+  if (/resource slots|e_resource_slots/i.test(msg)) {
+    return (
+      'MetaApi requires extra resource slots for this broker account (a paid MetaApi option). ' +
+      'We retried automatically with MetaApi’s recommended slot count. If this persists, top up MetaApi billing at https://app.metaapi.cloud or contact support.'
+    );
+  }
   return msg || 'MetaApi account provisioning failed.';
 }
 
