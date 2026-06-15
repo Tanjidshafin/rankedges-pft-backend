@@ -119,14 +119,74 @@ function resolveDailyGainPercent(raw, fractionDigits = 2) {
 
 /**
  * MetaStats gain / absoluteGain multiplier-style ratios.
- * Docs example: absoluteGain ~1.12 → 112% display. Live API often returns values already in % (e.g. -76.99).
+ * Fallback when deposits are unavailable — prefer deriveGainPercentFromDeposits in mapMetaStatsToAccountMetrics.
  */
 function gainMultiplierToPercent(value, fractionDigits = 2) {
   if (value === null || value === undefined) return null;
   const n = Number(value);
   if (!Number.isFinite(n)) return null;
-  if (Math.abs(n) <= 2 && n !== 0) return Number((n * 100).toFixed(fractionDigits));
-  return Number(n.toFixed(fractionDigits));
+  if (n === 0) return 0;
+
+  const abs = Math.abs(n);
+  let result;
+  if (abs < 1) {
+    result = n * 100;
+  } else if (abs >= 2) {
+    result = n;
+  } else {
+    result = n >= 0 ? (n - 1) * 100 : (n + 1) * 100;
+  }
+  return Number(result.toFixed(fractionDigits));
+}
+
+function deriveGainPercentFromDeposits(profit, deposits, withdrawals = 0) {
+  const netDeposits = Number(deposits) - Number(withdrawals || 0);
+  if (!Number.isFinite(Number(profit)) || !Number.isFinite(netDeposits) || netDeposits <= 0) {
+    return null;
+  }
+  return Number(((Number(profit) / netDeposits) * 100).toFixed(2));
+}
+
+function deriveAbsoluteGainPercent(balance, deposits, withdrawals = 0) {
+  const netDeposits = Number(deposits) - Number(withdrawals || 0);
+  if (!Number.isFinite(Number(balance)) || !Number.isFinite(netDeposits) || netDeposits <= 0) {
+    return null;
+  }
+  return Number((((Number(balance) - netDeposits) / netDeposits) * 100).toFixed(2));
+}
+
+function resolveHeadlineGainPercent(rawGain, profit, deposits, withdrawals) {
+  const fromDeposits = deriveGainPercentFromDeposits(profit, deposits, withdrawals);
+  const fromApi = gainMultiplierToPercent(rawGain);
+
+  if (fromDeposits != null) {
+    if (
+      fromApi != null &&
+      fromDeposits !== 0 &&
+      (Math.abs(fromApi / fromDeposits) > 5 || Math.abs(fromApi - fromDeposits) > Math.max(2, Math.abs(fromDeposits) * 2))
+    ) {
+      console.warn('[MetaStats][gain] using deposit-derived gain; API mapping diverged', {
+        fromDeposits,
+        fromApi,
+        profit,
+        deposits,
+        rawGain,
+      });
+    }
+    return fromDeposits;
+  }
+
+  return fromApi;
+}
+
+function resolveAbsoluteGainPercent(rawAbsGain, balance, profit, deposits, withdrawals) {
+  const fromBalance = deriveAbsoluteGainPercent(balance, deposits, withdrawals);
+  if (fromBalance != null) return fromBalance;
+
+  const fromProfit = deriveGainPercentFromDeposits(profit, deposits, withdrawals);
+  if (fromProfit != null) return fromProfit;
+
+  return gainMultiplierToPercent(rawAbsGain);
 }
 
 /** @deprecated Use compoundRateToPercent or gainMultiplierToPercent */
@@ -366,21 +426,32 @@ function mapMetaStatsToAccountMetrics(body) {
     }));
   }
 
+  const profit = coerceNumber(raw.profit);
+  const deposits = coerceNumber(raw.deposits);
+  const withdrawals = coerceNumber(raw.withdrawals);
+  const balance = coerceNumber(raw.balance);
+
   const mapped = {
-    gain: gainMultiplierToPercent(raw.gain),
-    metaapi_abs_gain: gainMultiplierToPercent(raw.absoluteGain),
+    gain: resolveHeadlineGainPercent(raw.gain, profit, deposits, withdrawals),
+    metaapi_abs_gain: resolveAbsoluteGainPercent(
+      raw.absoluteGain,
+      balance,
+      profit,
+      deposits,
+      withdrawals,
+    ),
     metaapi_daily_gain: resolveDailyGainPercent(raw),
     metaapi_monthly_gain: compoundRateToPercent(raw.monthlyGain),
     dd: resolveMaxDrawdownPercent(raw),
-    profit: coerceNumber(raw.profit),
-    balance: coerceNumber(raw.balance),
+    profit,
+    balance: balance,
     equity: coerceNumber(raw.equity),
     metaapi_highest_balance: coerceNumber(raw.highestBalance),
     metaapi_highest_balance_date:
       typeof raw.highestBalanceDate === 'string' ? raw.highestBalanceDate : null,
     metaapi_interest: coerceNumber(raw.interest),
-    metaapi_deposits: coerceNumber(raw.deposits),
-    metaapi_withdrawals: coerceNumber(raw.withdrawals),
+    metaapi_deposits: deposits,
+    metaapi_withdrawals: withdrawals,
     win_rate: percentAlreadyDisplay(raw.wonTradesPercent, 2),
     total_trades: totalTrades,
   };
@@ -456,6 +527,10 @@ module.exports = {
   getMetaStatsApiUrl,
   compoundRateToPercent,
   gainMultiplierToPercent,
+  deriveGainPercentFromDeposits,
+  deriveAbsoluteGainPercent,
+  resolveHeadlineGainPercent,
+  resolveAbsoluteGainPercent,
   resolveDailyGainPercent,
   ratioToPercentDisplay,
   /** @deprecated alias — plan name */

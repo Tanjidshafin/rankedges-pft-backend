@@ -27,6 +27,11 @@ const {
   waitForProvisioningDeployed,
 } = require('./metaApiProvisioningFeatures');
 const { buildLeaderboardMetricUpdate } = require('./contestGainMetrics');
+const { compareContestLeaderboardEntries, resolveLeaderboardScore, sortContestLeaderboardEntries, resolveLeaderboardEntryScore } = require('./contestRanking');
+const { rank3v3LeaderboardEntries } = require('./contestRanking3v3');
+const { rank1v1LeaderboardEntries } = require('./contestRanking1v1');
+const { refreshGlobalLeaderboardsInternal } = require('./globalLeaderboard');
+const { loadContestScopedMetricsForEntry } = require('./contestScopedMetrics');
 const { assertMetaApiCloudAccountId } = require('./metaApiProvisioningId');
 const { provisionInvestorMetaApiAccount } = require('./metaApiProvisionInvestor');
 const {
@@ -125,12 +130,25 @@ const ACHIEVEMENT_CRON_PAGE_SIZE = Math.max(
   50,
   Math.min(Number(process.env.ACHIEVEMENT_CRON_PAGE_SIZE) || 200, 500),
 );
+const CONTEST_RANKING_CRON_ENABLED =
+  String(process.env.CONTEST_RANKING_CRON_ENABLED || 'false').toLowerCase() === 'true';
+const CONTEST_RANKING_CRON_SCHEDULE = process.env.CONTEST_RANKING_CRON_SCHEDULE || '*/1 * * * *';
+const CONTEST_RANKING_CRON_TIMEZONE =
+  process.env.CONTEST_RANKING_CRON_TIMEZONE || INTERNAL_CRON_TIMEZONE;
+const GLOBAL_LEADERBOARD_CRON_ENABLED =
+  String(process.env.GLOBAL_LEADERBOARD_CRON_ENABLED || 'false').toLowerCase() === 'true';
+const GLOBAL_LEADERBOARD_CRON_INTERVAL_MS = Math.max(
+  5000,
+  Number(process.env.GLOBAL_LEADERBOARD_CRON_INTERVAL_MS || 5000),
+);
 
 const schedulerState = {
   syncRunning: false,
   captureRunning: false,
   pftLiveRunning: false,
   achievementCronRunning: false,
+  contestRankingRunning: false,
+  globalLeaderboardRunning: false,
 };
 function initializeFirebaseAdmin() {
   if (admin.apps.length > 0) return;
@@ -2002,24 +2020,17 @@ async function applyPftSnapshotStatusesToEntries(entries, batchId) {
 }
 
 function calculateContestScore(gain, dd, profit, balance, scoringMode) {
-  switch (scoringMode) {
-    case 'profit':
-      return Number(profit) || 0;
-    case 'balance':
-      return Number(balance) || 0;
-    case 'risk_adjusted': {
-      const drawdown = Number(dd) || 0;
-      return drawdown > 0 ? (Number(gain) || 0) / drawdown : Number(gain) || 0;
-    }
-    case 'gain':
-    default:
-      return Number(gain) || 0;
-  }
+  return resolveLeaderboardScore(
+    { type: 'league', scoring_mode: scoringMode },
+    { gain, dd, profit, balance },
+    0,
+  );
 }
 
-async function syncAccountToContestData(accountId) {
+async function syncAccountToContestData(accountId, options = {}) {
+  const { skipRankingUpdate = false } = options;
   const accountSnap = await db.collection(COLLECTIONS.accounts).doc(String(accountId)).get();
-  if (!accountSnap.exists) return;
+  if (!accountSnap.exists) return [];
   const account = { id: accountSnap.id, ...accountSnap.data() };
 
   const lbSnap = await db.collection(COLLECTIONS.leaderboard).where('account_id', '==', String(accountId)).get();
@@ -2039,7 +2050,7 @@ async function syncAccountToContestData(accountId) {
     if (contest.rankings_locked) continue;
 
     const startingBalance = Number(entry.starting_balance) || 0;
-    const metrics = buildLeaderboardMetricUpdate({
+    const metrics = await loadContestScopedMetricsForEntry(db, COLLECTIONS, {
       contest,
       account,
       entry: {
@@ -2050,11 +2061,6 @@ async function syncAccountToContestData(accountId) {
       },
     });
 
-    const score =
-      contest.type === 'standard'
-        ? Number(entry.score) || 0
-        : calculateContestScore(metrics.gain, metrics.dd, metrics.profit, metrics.balance, contest.scoring_mode);
-
     await lbDoc.ref.set(
       {
         gain: metrics.gain,
@@ -2062,7 +2068,8 @@ async function syncAccountToContestData(accountId) {
         profit: metrics.profit,
         balance: metrics.balance,
         equity: metrics.equity,
-        score,
+        score: metrics.score,
+        total_lot: metrics.total_lot ?? entry.total_lot ?? 0,
         peak_equity: metrics.peak_equity,
         lowest_equity: metrics.lowest_equity,
         score_updated_by: 'user_account_sync',
@@ -2114,9 +2121,13 @@ async function syncAccountToContestData(accountId) {
     affectedContestIds.add(String(entry.contest_id));
   }
 
-  for (const contestId of affectedContestIds) {
-    await updateContestRankingsServer(contestId);
+  if (!skipRankingUpdate) {
+    for (const contestId of affectedContestIds) {
+      await updateContestRankingsServer(contestId);
+    }
   }
+
+  return [...affectedContestIds];
 }
 
 async function updateContestRankingsServer(contestId, options = {}) {
@@ -2145,7 +2156,7 @@ async function updateContestRankingsServer(contestId, options = {}) {
       deduped.push(entries[0]);
       continue;
     }
-    entries.sort((left, right) => (Number(right.score) || 0) - (Number(left.score) || 0));
+    entries.sort((left, right) => compareContestLeaderboardEntries(contest, left, right));
     deduped.push(entries[0]);
     for (let index = 1; index < entries.length; index += 1) {
       dedupeBatch.delete(db.collection(COLLECTIONS.leaderboard).doc(entries[index].id));
@@ -2188,25 +2199,28 @@ async function updateContestRankingsServer(contestId, options = {}) {
       });
       await statusBatch.commit();
     }
+  } else if (contest.type === '1v1') {
+    const membersSnap = await db
+      .collection('contestRoomMembers')
+      .where('contest_id', '==', contestId)
+      .get();
+    const roomMembers = membersSnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
+    allRanked = rank1v1LeaderboardEntries(contest, deduped, roomMembers).map((entry) => ({
+      ...entry,
+      score: resolveLeaderboardEntryScore(contest, entry),
+    }));
+  } else if (contest.type === '3v3') {
+    const membersSnap = await db
+      .collection('contestRoomMembers')
+      .where('contest_id', '==', contestId)
+      .get();
+    const roomMembers = membersSnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
+    allRanked = rank3v3LeaderboardEntries(contest, deduped, roomMembers).map((entry) => ({
+      ...entry,
+      score: resolveLeaderboardEntryScore(contest, entry),
+    }));
   } else {
-    const active = deduped.filter(
-      (entry) => entry.participant_status !== 'disqualified' && entry.participant_status !== 'withdrawn',
-    );
-    const disqualified = deduped.filter(
-      (entry) => entry.participant_status === 'disqualified' || entry.participant_status === 'withdrawn',
-    );
-    const sorted = [...active].sort((left, right) => {
-      if ((Number(right.score) || 0) !== (Number(left.score) || 0)) {
-        return (Number(right.score) || 0) - (Number(left.score) || 0);
-      }
-      if ((Number(left.dd) || 0) !== (Number(right.dd) || 0)) {
-        return (Number(left.dd) || 0) - (Number(right.dd) || 0);
-      }
-      const leftTime = left.createdAt?.toMillis?.() ?? 0;
-      const rightTime = right.createdAt?.toMillis?.() ?? 0;
-      return leftTime - rightTime;
-    });
-    allRanked = [...sorted, ...disqualified].map((entry, index) => ({ ...entry, rank: index + 1 }));
+    allRanked = sortContestLeaderboardEntries(contest, deduped);
   }
 
   const rankBatch = db.batch();
@@ -2218,6 +2232,9 @@ async function updateContestRankingsServer(contestId, options = {}) {
       rankPayload.rank = FieldValue.delete();
     } else {
       rankPayload.rank = entry.rank;
+    }
+    if (entry.score != null && Number.isFinite(Number(entry.score))) {
+      rankPayload.score = entry.score;
     }
     rankBatch.set(db.collection(COLLECTIONS.leaderboard).doc(entry.id), rankPayload, { merge: true });
   });
@@ -2472,6 +2489,63 @@ async function refreshActivePftLiveLeaderboards() {
   }
 
   return { ok: true, batches: results.length, results };
+}
+
+async function refreshOngoingContestLeaderboards() {
+  const contestsSnap = await db.collection(COLLECTIONS.contests).get();
+  const ongoing = contestsSnap.docs
+    .map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }))
+    .filter((contest) => {
+      const status = normalizeContestStatus(contest.status);
+      return status === 'ongoing' && contest.type !== 'pft' && !contest.rankings_locked;
+    });
+
+  const results = [];
+
+  for (const contest of ongoing) {
+    try {
+      const lbSnap = await db
+        .collection(COLLECTIONS.leaderboard)
+        .where('contest_id', '==', contest.id)
+        .get();
+      const accountIds = [
+        ...new Set(
+          lbSnap.docs
+            .map((docSnap) => String(docSnap.data().account_id || ''))
+            .filter(Boolean),
+        ),
+      ];
+
+      let metricsRefreshed = 0;
+      for (const accountId of accountIds) {
+        try {
+          await syncAccountToContestData(accountId, { skipRankingUpdate: true });
+          metricsRefreshed += 1;
+        } catch (syncError) {
+          console.warn(
+            `[contest-rankings] metric refresh failed contest=${contest.id} account=${accountId}:`,
+            syncError instanceof Error ? syncError.message : syncError,
+          );
+        }
+      }
+
+      await updateContestRankingsServer(contest.id);
+      results.push({ contestId: contest.id, reranked: true, metricsRefreshed });
+    } catch (error) {
+      results.push({
+        contestId: contest.id,
+        reranked: false,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    mode: 'db_rerank_only',
+    contests: results.length,
+    results,
+  };
 }
 
 async function syncPftBatchContestLeaderboard(batchId, contestId) {
@@ -3791,6 +3865,57 @@ app.post('/api/contests/:contestId/rooms/:roomId/assign-teams', requireUser, asy
   }
 });
 
+app.post('/api/contests/:contestId/rerank-leaderboard', requireUser, async (req, res) => {
+  try {
+    const contestId = String(req.params.contestId || '').trim();
+    if (!contestId) {
+      res.status(400).json({ error: 'contestId is required.' });
+      return;
+    }
+
+    const uid = req.firebaseUser.uid;
+    const [contestSnap, userSnap] = await Promise.all([
+      db.collection(COLLECTIONS.contests).doc(contestId).get(),
+      db.collection(COLLECTIONS.users).doc(uid).get(),
+    ]);
+
+    if (!contestSnap.exists) {
+      res.status(404).json({ error: 'Contest not found.' });
+      return;
+    }
+
+    const contest = contestSnap.data();
+    if (contest.rankings_locked) {
+      res.json({ ok: true, skipped: true, reason: 'rankings_locked' });
+      return;
+    }
+
+    const isAdminUser = userSnap.exists && userSnap.data().role === 'admin';
+    const isCreator = contest.creator_id === uid;
+
+    if (!isAdminUser && !isCreator) {
+      const partSnap = await db
+        .collection(COLLECTIONS.contestParticipations)
+        .where('contest_id', '==', contestId)
+        .where('user_id', '==', uid)
+        .limit(1)
+        .get();
+      if (partSnap.empty) {
+        res.status(403).json({ error: 'You are not enrolled in this contest.' });
+        return;
+      }
+    }
+
+    await updateContestRankingsServer(contestId);
+    res.json({ ok: true, contestId });
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({
+      error: error instanceof Error ? error.message : 'Failed to rerank contest leaderboard.',
+    });
+  }
+});
+
 app.post('/api/contests/:contestId/participants/:userId/remove', requireUser, async (req, res) => {
   try {
     const contestId = String(req.params.contestId || '').trim();
@@ -4094,6 +4219,28 @@ app.post('/api/cron/check-achievements', requireCronSecret, async (_req, res) =>
   }
 });
 
+app.post('/api/cron/refresh-contest-rankings', requireCronSecret, async (_req, res) => {
+  try {
+    const result = await refreshOngoingContestLeaderboards();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to refresh contest rankings.',
+    });
+  }
+});
+
+app.post('/api/cron/sync-global-leaderboard', requireCronSecret, async (_req, res) => {
+  try {
+    const result = await refreshGlobalLeaderboardsInternal(db);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to sync global leaderboard.',
+    });
+  }
+});
+
 function wrapCronTask(taskName, lockKey, handler) {
   return async () => {
     if (schedulerState[lockKey]) {
@@ -4137,6 +4284,25 @@ function startAchievementCronScheduler() {
 
   console.log(
     `Achievement cron enabled (timezone=${ACHIEVEMENT_CRON_TIMEZONE}, schedule='${ACHIEVEMENT_CRON_SCHEDULE}', concurrency=${ACHIEVEMENT_CRON_CONCURRENCY}).`,
+  );
+}
+
+function startGlobalLeaderboardCronScheduler() {
+  if (!GLOBAL_LEADERBOARD_CRON_ENABLED) {
+    console.log('Global leaderboard cron disabled. Set GLOBAL_LEADERBOARD_CRON_ENABLED=true to enable.');
+    return;
+  }
+
+  setInterval(
+    () =>
+      wrapCronTask('global-leaderboard', 'globalLeaderboardRunning', () =>
+        refreshGlobalLeaderboardsInternal(db),
+      )(),
+    GLOBAL_LEADERBOARD_CRON_INTERVAL_MS,
+  );
+
+  console.log(
+    `Global leaderboard cron enabled (interval=${GLOBAL_LEADERBOARD_CRON_INTERVAL_MS}ms).`,
   );
 }
 
@@ -4184,6 +4350,25 @@ function startInternalCronScheduler() {
     (contestId) => startContestAdmin(db, contestId),
     notificationAdmin,
   );
+
+  if (CONTEST_RANKING_CRON_ENABLED) {
+    if (!cron.validate(CONTEST_RANKING_CRON_SCHEDULE)) {
+      console.error(`Invalid contest ranking cron schedule: ${CONTEST_RANKING_CRON_SCHEDULE}`);
+    } else {
+      cron.schedule(
+        CONTEST_RANKING_CRON_SCHEDULE,
+        wrapCronTask('contest-rankings', 'contestRankingRunning', () => refreshOngoingContestLeaderboards()),
+        { timezone: CONTEST_RANKING_CRON_TIMEZONE },
+      );
+      console.log(
+        `Contest ranking cron enabled (timezone=${CONTEST_RANKING_CRON_TIMEZONE}, schedule='${CONTEST_RANKING_CRON_SCHEDULE}', mode=db_rerank_only).`,
+      );
+    }
+  } else {
+    console.log('Contest ranking cron disabled. Set CONTEST_RANKING_CRON_ENABLED=true to enable.');
+  }
+
+  startGlobalLeaderboardCronScheduler();
 }
 
 app.listen(PORT, () => {

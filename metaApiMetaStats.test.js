@@ -3,6 +3,8 @@ const assert = require('node:assert/strict');
 const {
   compoundRateToPercent,
   gainMultiplierToPercent,
+  deriveGainPercentFromDeposits,
+  deriveAbsoluteGainPercent,
   mapMetaStatsToAccountMetrics,
   normalizeDailyGrowthSeries,
 } = require('./metaApiMetaStats');
@@ -50,12 +52,91 @@ describe('compoundRateToPercent', () => {
 });
 
 describe('gainMultiplierToPercent', () => {
-  it('converts MetaStats absoluteGain multiplier', () => {
-    assert.equal(gainMultiplierToPercent(1.1206999999999985), 112.07);
+  it('converts decimal rates below 1', () => {
+    assert.equal(gainMultiplierToPercent(0.1212), 12.12);
+  });
+
+  it('converts multiplier offset in 1..2 band', () => {
+    assert.equal(gainMultiplierToPercent(1.1206999999999985), 12.07);
   });
 
   it('passes through large percent values already in display units', () => {
     assert.equal(gainMultiplierToPercent(-76.99), -76.99);
+    assert.equal(gainMultiplierToPercent(12.12), 12.12);
+  });
+});
+
+describe('deriveGainPercentFromDeposits', () => {
+  it('computes gain from profit and deposits', () => {
+    assert.equal(deriveGainPercentFromDeposits(15.09, 1000), 1.51);
+    assert.equal(deriveGainPercentFromDeposits(1.66, 1000.01), 0.17);
+    assert.equal(deriveGainPercentFromDeposits(-15.35, 1000), -1.53);
+  });
+
+  it('computes absolute gain from balance and deposits', () => {
+    assert.equal(deriveAbsoluteGainPercent(1010.08, 1000), 1.01);
+  });
+});
+
+describe('mapMetaStatsToAccountMetrics — small gain inflation regression', () => {
+  it('does not 100x inflate gain when API sends percent-scale values in 0..2 range', () => {
+    const mapped = mapMetaStatsToAccountMetrics({
+      metrics: {
+        gain: 1.509,
+        absoluteGain: 1.509,
+        profit: 15.09,
+        deposits: 1000,
+        withdrawals: 0,
+        balance: 1010.08,
+        equity: 1015.1,
+        trades: 2,
+        wonTradesPercent: 100,
+      },
+    });
+
+    assert.equal(mapped.gain, 1.51);
+    assert.equal(mapped.metaapi_abs_gain, 1.01);
+    assert.notEqual(mapped.gain, 150.9);
+  });
+
+  it('maps modest profit without 100x inflation', () => {
+    const mapped = mapMetaStatsToAccountMetrics({
+      metrics: {
+        gain: 0.166,
+        absoluteGain: 0.166,
+        profit: 1.66,
+        deposits: 1000.01,
+        withdrawals: 0,
+        balance: 1001.67,
+        equity: 1001.67,
+        trades: 1,
+        wonTradesPercent: 100,
+      },
+    });
+
+    assert.equal(mapped.gain, 0.17);
+    assert.equal(mapped.metaapi_abs_gain, 0.17);
+    assert.notEqual(mapped.gain, 16.6);
+  });
+
+  it('maps losses without 100x inflation', () => {
+    const mapped = mapMetaStatsToAccountMetrics({
+      metrics: {
+        gain: -1.535,
+        absoluteGain: -1.535,
+        profit: -15.35,
+        deposits: 1000,
+        withdrawals: 0,
+        balance: 1001.98,
+        equity: 984.46,
+        trades: 18,
+        wonTradesPercent: 66.7,
+      },
+    });
+
+    assert.equal(mapped.gain, -1.53);
+    assert.equal(mapped.metaapi_abs_gain, 0.2);
+    assert.notEqual(mapped.gain, -153.5);
   });
 });
 
@@ -79,6 +160,8 @@ describe('mapMetaStatsToAccountMetrics — login 169955 scenario', () => {
       },
     });
 
+    assert.equal(mapped.gain, 12.12);
+    assert.equal(mapped.metaapi_abs_gain, 12.12);
     assert.equal(mapped.metaapi_daily_gain, 12.12);
     assert.equal(mapped.metaapi_monthly_gain, 12.12);
     assert.equal(mapped.profit, 121.17);
@@ -105,6 +188,8 @@ describe('mapMetaStatsToAccountMetrics — login 169955 scenario', () => {
       },
     });
 
+    assert.equal(mapped.gain, 12.1);
+    assert.equal(mapped.metaapi_abs_gain, 12.1);
     assert.equal(mapped.metaapi_daily_gain, 1.69);
     assert.equal(mapped.metaapi_monthly_gain, 12.12);
     assert.equal(mapped.profit, 121);
