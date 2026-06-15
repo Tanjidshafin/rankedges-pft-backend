@@ -134,6 +134,68 @@ async function createProvisionedUser(admin, db, input, adminUid, options = {}) {
   return { uid: authUser.uid, email };
 }
 
+async function deleteProvisionedUser(admin, db, targetUserId, actorUid, options = {}) {
+  const { usersCollection = 'users', actorProfile = null } = options;
+  const userId = String(targetUserId || '').trim();
+  const actorId = String(actorUid || '').trim();
+
+  if (!userId) {
+    const error = new Error('User ID is required.');
+    error.status = 400;
+    throw error;
+  }
+
+  if (userId === actorId) {
+    const error = new Error('You cannot delete your own account.');
+    error.status = 400;
+    throw error;
+  }
+
+  const userSnap = await db.collection(usersCollection).doc(userId).get();
+  if (!userSnap.exists) {
+    const error = new Error('User not found.');
+    error.status = 404;
+    throw error;
+  }
+
+  const userData = userSnap.data() || {};
+  const targetIsSuperAdmin = userData.role === 'admin' && userData.adminTier === 'super';
+  const actorIsSuperAdmin = actorProfile?.role === 'admin' && actorProfile?.adminTier === 'super';
+
+  if (targetIsSuperAdmin && !actorIsSuperAdmin) {
+    const error = new Error('Only a super-admin can delete another super-admin.');
+    error.status = 403;
+    throw error;
+  }
+
+  if (targetIsSuperAdmin) {
+    const superAdminsSnap = await db
+      .collection(usersCollection)
+      .where('role', '==', 'admin')
+      .where('adminTier', '==', 'super')
+      .get();
+    if (superAdminsSnap.size <= 1) {
+      const error = new Error('Cannot delete the last super-admin account.');
+      error.status = 400;
+      throw error;
+    }
+  }
+
+  await db.collection(usersCollection).doc(userId).delete();
+
+  try {
+    await admin.auth().deleteUser(userId);
+  } catch (authError) {
+    if (authError.code !== 'auth/user-not-found') {
+      const error = new Error(authError.message || 'Failed to delete authentication user.');
+      error.status = 500;
+      throw error;
+    }
+  }
+
+  return { uid: userId, deleted: true };
+}
+
 async function verifyProvisionedSession(admin, db, tokenUser, options = {}) {
   const { usersCollection = 'users' } = options;
   const authUid = String(tokenUser?.uid || '').trim();
@@ -181,5 +243,6 @@ module.exports = {
   normalizeEmail,
   provisionedUserByEmail,
   createProvisionedUser,
+  deleteProvisionedUser,
   verifyProvisionedSession,
 };

@@ -49,6 +49,7 @@ const {
 } = require('./contestPrivileged');
 const {
   createProvisionedUser,
+  deleteProvisionedUser,
   verifyProvisionedSession,
 } = require('./userProvisioning');
 const {
@@ -3849,6 +3850,20 @@ app.post('/api/admin/users', requireAdminPermission('users'), async (req, res) =
   } catch (error) {
     const status = error.status || 500;
     res.status(status).json({ error: error instanceof Error ? error.message : 'Failed to create user.' });
+  }
+});
+
+app.delete('/api/admin/users/:userId', requireAdminPermission('users'), async (req, res) => {
+  try {
+    const userId = String(req.params.userId || '').trim();
+    const result = await deleteProvisionedUser(admin, db, userId, req.user.uid, {
+      usersCollection: COLLECTIONS.users,
+      actorProfile: req.user.profile,
+    });
+    res.json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error instanceof Error ? error.message : 'Failed to delete user.' });
   }
 });
 
