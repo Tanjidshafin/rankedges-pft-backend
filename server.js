@@ -43,6 +43,7 @@ const {
 } = require('./syncProgressReporter');
 const { createAchievementEngine, DEFINITION_BY_ID } = require('./achievementEngine');
 const { createNotificationAdmin } = require('./notificationAdmin');
+const { notifyContestRankChanges } = require('./contestRankNotifications');
 const { scheduleContestLifecycleCron } = require('./contestLifecycle');
 const { startContestAdmin, normalizeContestStatus } = require('./contestStart');
 const {
@@ -131,12 +132,12 @@ const ACHIEVEMENT_CRON_PAGE_SIZE = Math.max(
   Math.min(Number(process.env.ACHIEVEMENT_CRON_PAGE_SIZE) || 200, 500),
 );
 const CONTEST_RANKING_CRON_ENABLED =
-  String(process.env.CONTEST_RANKING_CRON_ENABLED || 'false').toLowerCase() === 'true';
+  String(process.env.CONTEST_RANKING_CRON_ENABLED ?? 'true').toLowerCase() === 'true';
 const CONTEST_RANKING_CRON_SCHEDULE = process.env.CONTEST_RANKING_CRON_SCHEDULE || '*/1 * * * *';
 const CONTEST_RANKING_CRON_TIMEZONE =
   process.env.CONTEST_RANKING_CRON_TIMEZONE || INTERNAL_CRON_TIMEZONE;
 const GLOBAL_LEADERBOARD_CRON_ENABLED =
-  String(process.env.GLOBAL_LEADERBOARD_CRON_ENABLED || 'false').toLowerCase() === 'true';
+  String(process.env.GLOBAL_LEADERBOARD_CRON_ENABLED ?? 'true').toLowerCase() === 'true';
 const GLOBAL_LEADERBOARD_CRON_INTERVAL_MS = Math.max(
   5000,
   Number(process.env.GLOBAL_LEADERBOARD_CRON_INTERVAL_MS || 5000),
@@ -2508,6 +2509,14 @@ async function refreshOngoingContestLeaderboards() {
         .collection(COLLECTIONS.leaderboard)
         .where('contest_id', '==', contest.id)
         .get();
+      const previousRanks = new Map();
+      for (const docSnap of lbSnap.docs) {
+        const data = docSnap.data();
+        if (data.user_id && data.rank != null) {
+          previousRanks.set(String(data.user_id), Number(data.rank));
+        }
+      }
+
       const accountIds = [
         ...new Set(
           lbSnap.docs
@@ -2530,6 +2539,14 @@ async function refreshOngoingContestLeaderboards() {
       }
 
       await updateContestRankingsServer(contest.id);
+
+      const afterSnap = await db
+        .collection(COLLECTIONS.leaderboard)
+        .where('contest_id', '==', contest.id)
+        .get();
+      const afterEntries = afterSnap.docs.map((docSnap) => ({ id: docSnap.id, ...docSnap.data() }));
+      await notifyContestRankChanges(notificationAdmin, contest, previousRanks, afterEntries);
+
       results.push({ contestId: contest.id, reranked: true, metricsRefreshed });
     } catch (error) {
       results.push({
@@ -4293,13 +4310,14 @@ function startGlobalLeaderboardCronScheduler() {
     return;
   }
 
-  setInterval(
-    () =>
-      wrapCronTask('global-leaderboard', 'globalLeaderboardRunning', () =>
-        refreshGlobalLeaderboardsInternal(db),
-      )(),
-    GLOBAL_LEADERBOARD_CRON_INTERVAL_MS,
+  const runGlobalLeaderboardCron = wrapCronTask('global-leaderboard', 'globalLeaderboardRunning', () =>
+    refreshGlobalLeaderboardsInternal(db),
   );
+
+  setInterval(runGlobalLeaderboardCron, GLOBAL_LEADERBOARD_CRON_INTERVAL_MS);
+
+  // Run once shortly after startup so ranks are not stale until the first interval.
+  setTimeout(runGlobalLeaderboardCron, 10_000);
 
   console.log(
     `Global leaderboard cron enabled (interval=${GLOBAL_LEADERBOARD_CRON_INTERVAL_MS}ms).`,
@@ -4355,11 +4373,18 @@ function startInternalCronScheduler() {
     if (!cron.validate(CONTEST_RANKING_CRON_SCHEDULE)) {
       console.error(`Invalid contest ranking cron schedule: ${CONTEST_RANKING_CRON_SCHEDULE}`);
     } else {
+      const runContestRankingCron = wrapCronTask(
+        'contest-rankings',
+        'contestRankingRunning',
+        () => refreshOngoingContestLeaderboards(),
+      );
       cron.schedule(
         CONTEST_RANKING_CRON_SCHEDULE,
-        wrapCronTask('contest-rankings', 'contestRankingRunning', () => refreshOngoingContestLeaderboards()),
+        runContestRankingCron,
         { timezone: CONTEST_RANKING_CRON_TIMEZONE },
       );
+      // Run once shortly after startup so ongoing contests get ranks without waiting for the first tick.
+      setTimeout(runContestRankingCron, 15_000);
       console.log(
         `Contest ranking cron enabled (timezone=${CONTEST_RANKING_CRON_TIMEZONE}, schedule='${CONTEST_RANKING_CRON_SCHEDULE}', mode=db_rerank_only).`,
       );

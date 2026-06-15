@@ -8,7 +8,7 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "check": "node --check server.js",
-    "test": "node --test metaApiMetaStats.test.js contestRanking.test.mjs contestRanking3v3.test.mjs contestRanking1v1.test.mjs"
+    "test": "node --test metaApiMetaStats.test.js contestRankNotifications.test.js contestRanking.test.mjs contestRanking3v3.test.mjs contestRanking1v1.test.mjs"
   },
   "dependencies": {
     "cors": "^2.8.5",
