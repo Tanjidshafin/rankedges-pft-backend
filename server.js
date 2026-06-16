@@ -61,6 +61,8 @@ const {
 } = require('./contestPrivileged');
 const {
   createProvisionedUser,
+  createSelfRegisteredUser,
+  completeUserProfile,
   deleteProvisionedUser,
   verifyProvisionedSession,
 } = require('./userProvisioning');
@@ -4543,6 +4545,32 @@ app.delete('/api/admin/users/:userId', requireAdminPermission('users'), async (r
   } catch (error) {
     const status = error.status || 500;
     res.status(status).json({ error: error instanceof Error ? error.message : 'Failed to delete user.' });
+  }
+});
+
+app.post('/api/auth/register', async (req, res) => {
+  try {
+    const result = await createSelfRegisteredUser(admin, db, req.body || {}, {
+      usersCollection: COLLECTIONS.users,
+      FieldValue,
+    });
+    res.status(201).json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error instanceof Error ? error.message : 'Registration failed.' });
+  }
+});
+
+app.post('/api/auth/complete-profile', requireUser, async (req, res) => {
+  try {
+    const result = await completeUserProfile(admin, db, req.firebaseUser, req.body || {}, {
+      usersCollection: COLLECTIONS.users,
+      FieldValue,
+    });
+    res.status(201).json(result);
+  } catch (error) {
+    const status = error.status || 500;
+    res.status(status).json({ error: error instanceof Error ? error.message : 'Failed to complete profile.' });
   }
 });
 

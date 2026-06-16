@@ -1,5 +1,5 @@
 /**
- * Admin-provisioned user creation and sign-in verification.
+ * User creation (admin + self-registration) and sign-in verification.
  */
 
 const NOT_ALLOWED_MESSAGE =
@@ -53,6 +53,31 @@ function validateCreateUserInput(input) {
   return { name, country, phone, email, password, phoneCountry };
 }
 
+function validateProfileInput(input) {
+  const name = asTrimmedString(input.name);
+  const country = asTrimmedString(input.country);
+  const phone = asTrimmedString(input.phone);
+  const phoneCountry = asTrimmedString(input.phoneCountry).toUpperCase();
+
+  if (!name) {
+    const error = new Error('Full name is required.');
+    error.status = 400;
+    throw error;
+  }
+  if (!country) {
+    const error = new Error('Country is required.');
+    error.status = 400;
+    throw error;
+  }
+  if (!phone) {
+    const error = new Error('Phone number is required.');
+    error.status = 400;
+    throw error;
+  }
+
+  return { name, country, phone, phoneCountry };
+}
+
 async function provisionedUserByEmail(db, email, usersCollection = 'users') {
   const normalized = normalizeEmail(email);
   if (!normalized) {
@@ -66,10 +91,7 @@ async function provisionedUserByEmail(db, email, usersCollection = 'users') {
   return { uid: doc.id, data: doc.data() };
 }
 
-async function createProvisionedUser(admin, db, input, adminUid, options = {}) {
-  const { usersCollection = 'users', FieldValue } = options;
-  const { name, country, phone, email, password, phoneCountry } = validateCreateUserInput(input);
-
+async function assertEmailAvailableForRegistration(db, admin, email, usersCollection) {
   const existing = await provisionedUserByEmail(db, email, usersCollection);
   if (existing) {
     const error = new Error('A user with this email already exists.');
@@ -90,6 +112,21 @@ async function createProvisionedUser(admin, db, input, adminUid, options = {}) {
       throw error;
     }
   }
+}
+
+async function createAuthUserAndProfile(admin, db, options) {
+  const {
+    usersCollection,
+    FieldValue,
+    email,
+    password,
+    name,
+    country,
+    phone,
+    phoneCountry,
+    roleConfirmed,
+    createdBy,
+  } = options;
 
   let authUser;
   try {
@@ -113,8 +150,8 @@ async function createProvisionedUser(admin, db, input, adminUid, options = {}) {
     phone,
     ...(phoneCountry ? { phoneCountry } : {}),
     role: 'trader',
-    roleConfirmed: true,
-    createdBy: adminUid,
+    roleConfirmed,
+    createdBy,
     createdAt: FieldValue.serverTimestamp(),
   };
 
@@ -132,6 +169,96 @@ async function createProvisionedUser(admin, db, input, adminUid, options = {}) {
   }
 
   return { uid: authUser.uid, email };
+}
+
+async function createProvisionedUser(admin, db, input, adminUid, options = {}) {
+  const { usersCollection = 'users', FieldValue } = options;
+  const { name, country, phone, email, password, phoneCountry } = validateCreateUserInput(input);
+
+  await assertEmailAvailableForRegistration(db, admin, email, usersCollection);
+
+  return createAuthUserAndProfile(admin, db, {
+    usersCollection,
+    FieldValue,
+    email,
+    password,
+    name,
+    country,
+    phone,
+    phoneCountry,
+    roleConfirmed: true,
+    createdBy: adminUid,
+  });
+}
+
+async function createSelfRegisteredUser(admin, db, input, options = {}) {
+  const { usersCollection = 'users', FieldValue } = options;
+  const { name, country, phone, email, password, phoneCountry } = validateCreateUserInput(input);
+
+  await assertEmailAvailableForRegistration(db, admin, email, usersCollection);
+
+  return createAuthUserAndProfile(admin, db, {
+    usersCollection,
+    FieldValue,
+    email,
+    password,
+    name,
+    country,
+    phone,
+    phoneCountry,
+    roleConfirmed: false,
+    createdBy: 'self',
+  });
+}
+
+async function completeUserProfile(admin, db, tokenUser, input, options = {}) {
+  const { usersCollection = 'users', FieldValue } = options;
+  const authUid = String(tokenUser?.uid || '').trim();
+  const email = normalizeEmail(tokenUser?.email);
+  const { name, country, phone, phoneCountry } = validateProfileInput(input);
+
+  if (!authUid || !email) {
+    const error = new Error('Authentication email is required to complete your profile.');
+    error.status = 400;
+    throw error;
+  }
+
+  const existingDoc = await db.collection(usersCollection).doc(authUid).get();
+  if (existingDoc.exists) {
+    const error = new Error('Your profile already exists.');
+    error.status = 409;
+    throw error;
+  }
+
+  const existingByEmail = await provisionedUserByEmail(db, email, usersCollection);
+  if (existingByEmail && existingByEmail.uid !== authUid) {
+    const error = new Error(UID_MISMATCH_MESSAGE);
+    error.status = 409;
+    throw error;
+  }
+
+  const profile = {
+    uid: authUid,
+    email,
+    name,
+    country,
+    phone,
+    ...(phoneCountry ? { phoneCountry } : {}),
+    role: 'trader',
+    roleConfirmed: false,
+    createdBy: 'self',
+    createdAt: FieldValue.serverTimestamp(),
+  };
+
+  await db.collection(usersCollection).doc(authUid).set(profile);
+
+  try {
+    await admin.auth().updateUser(authUid, { displayName: name });
+  } catch {
+    // Non-fatal — profile is persisted.
+  }
+
+  return { uid: authUid, email };
 }
 
 async function deleteProvisionedUser(admin, db, targetUserId, actorUid, options = {}) {
@@ -223,7 +350,12 @@ async function verifyProvisionedSession(admin, db, tokenUser, options = {}) {
   };
 
   if (!provisioned) {
-    await rejectSession(NOT_ALLOWED_MESSAGE);
+    return {
+      uid: authUid,
+      email,
+      provisioned: false,
+      needsProfile: true,
+    };
   }
 
   if (provisioned.uid !== authUid) {
@@ -234,6 +366,7 @@ async function verifyProvisionedSession(admin, db, tokenUser, options = {}) {
     uid: provisioned.uid,
     email,
     provisioned: true,
+    needsProfile: false,
   };
 }
 
@@ -243,6 +376,8 @@ module.exports = {
   normalizeEmail,
   provisionedUserByEmail,
   createProvisionedUser,
+  createSelfRegisteredUser,
+  completeUserProfile,
   deleteProvisionedUser,
   verifyProvisionedSession,
 };
