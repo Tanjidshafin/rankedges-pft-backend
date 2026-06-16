@@ -7,6 +7,11 @@ function normalizeContestStatus(status) {
   return legacy[status] || status;
 }
 
+function resolveGainBasis(contest) {
+  if (!contest || contest.type === 'pft') return 'balance';
+  return contest.gain_basis === 'equity' ? 'equity' : 'balance';
+}
+
 /**
  * @param {import('firebase-admin').firestore.Firestore} db
  */
@@ -37,29 +42,72 @@ async function startContestAdmin(db, contestId) {
     throw new Error('3v3 contest requires at least 6 participants');
   }
 
+  const gainBasis = resolveGainBasis(contest);
   const batch = db.batch();
+  const FieldValue = require('firebase-admin/firestore').FieldValue;
   const now = new Date().toISOString();
 
   for (const partDoc of partsSnap.docs) {
     const participation = partDoc.data();
-    const balance = participation.testMode
-      ? participation.testBalance || 10000
-      : participation.starting_balance || 10000;
+    let balance = 10000;
+    let equity = 10000;
+
+    if (participation.testMode) {
+      balance = participation.testBalance || 10000;
+      equity = balance;
+    } else if (participation.starting_balance > 0) {
+      balance = Number(participation.starting_balance) || 10000;
+      equity = Number(participation.starting_equity ?? balance) || balance;
+    } else if (participation.account_id) {
+      const accountSnap = await db.collection('tradingAccounts').doc(String(participation.account_id)).get();
+      if (accountSnap.exists) {
+        const account = accountSnap.data();
+        balance = Number(account.balance ?? 0);
+        equity = Number(account.equity ?? balance);
+      }
+    }
+
+    const watermark = gainBasis === 'equity' ? equity : balance;
 
     batch.update(partDoc.ref, {
       participant_status: 'active',
       starting_balance: balance,
+      starting_equity: equity,
       current_balance: balance,
-      peak_equity: balance,
-      lowest_equity: balance,
+      current_equity: equity,
+      peak_equity: watermark,
+      lowest_equity: watermark,
     });
+
+    const lbSnap = await db
+      .collection('leaderboard')
+      .where('contest_id', '==', contestId)
+      .where('user_id', '==', participation.user_id)
+      .limit(1)
+      .get();
+
+    if (!lbSnap.empty) {
+      batch.update(lbSnap.docs[0].ref, {
+        starting_balance: balance,
+        starting_equity: equity,
+        balance,
+        equity,
+        peak_equity: watermark,
+        lowest_equity: watermark,
+        gain: 0,
+        dd: 0,
+        score: 0,
+        participant_status: 'active',
+        updatedAt: FieldValue.serverTimestamp(),
+      });
+    }
   }
 
   batch.update(contestRef, {
     status: 'ongoing',
     started_at: now,
     participants: participantCount,
-    updatedAt: require('firebase-admin/firestore').FieldValue.serverTimestamp(),
+    updatedAt: FieldValue.serverTimestamp(),
   });
 
   await batch.commit();

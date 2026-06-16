@@ -4,6 +4,23 @@
 
 const LOG_CAP = 8000;
 
+/** Ignore deposit-derived gain when net deposits are below this floor (avoids -1e6% from tiny deposits). */
+const MIN_NET_DEPOSITS_ABSOLUTE = 10;
+
+function resolveMinNetDeposits(balance) {
+  const envMin = Number(process.env.METASTATS_MIN_NET_DEPOSITS);
+  const floor = Number.isFinite(envMin) && envMin > 0 ? envMin : MIN_NET_DEPOSITS_ABSOLUTE;
+  const balanceRef = Number.isFinite(Number(balance)) && Number(balance) > 0 ? Number(balance) : 0;
+  return Math.max(floor, balanceRef * 0.001);
+}
+
+function sanitizeAccountGainPercent(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return null;
+  if (Math.abs(n) > 1_000_000) return 0;
+  return Number(n.toFixed(2));
+}
+
 /** First MetaStats build on busy brokers often exceeds 3 minutes (HTTP 202 polling). */
 const DEFAULT_METASTATS_POLL_MAX_MS = 10 * 60 * 1000;
 const MIN_METASTATS_POLL_MAX_MS = 60 * 1000;
@@ -152,12 +169,15 @@ function gainMultiplierToPercent(value, fractionDigits = 2) {
   return Number(result.toFixed(fractionDigits));
 }
 
-function deriveGainPercentFromDeposits(profit, deposits, withdrawals = 0) {
+function deriveGainPercentFromDeposits(profit, deposits, withdrawals = 0, balance = null) {
   const netDeposits = Number(deposits) - Number(withdrawals || 0);
   if (!Number.isFinite(Number(profit)) || !Number.isFinite(netDeposits) || netDeposits <= 0) {
     return null;
   }
-  return Number(((Number(profit) / netDeposits) * 100).toFixed(2));
+  if (netDeposits < resolveMinNetDeposits(balance)) {
+    return null;
+  }
+  return sanitizeAccountGainPercent((Number(profit) / netDeposits) * 100);
 }
 
 function deriveAbsoluteGainPercent(balance, deposits, withdrawals = 0) {
@@ -165,11 +185,14 @@ function deriveAbsoluteGainPercent(balance, deposits, withdrawals = 0) {
   if (!Number.isFinite(Number(balance)) || !Number.isFinite(netDeposits) || netDeposits <= 0) {
     return null;
   }
-  return Number((((Number(balance) - netDeposits) / netDeposits) * 100).toFixed(2));
+  if (netDeposits < resolveMinNetDeposits(balance)) {
+    return null;
+  }
+  return sanitizeAccountGainPercent(((Number(balance) - netDeposits) / netDeposits) * 100);
 }
 
-function resolveHeadlineGainPercent(rawGain, profit, deposits, withdrawals) {
-  const fromDeposits = deriveGainPercentFromDeposits(profit, deposits, withdrawals);
+function resolveHeadlineGainPercent(rawGain, profit, deposits, withdrawals, balance = null) {
+  const fromDeposits = deriveGainPercentFromDeposits(profit, deposits, withdrawals, balance);
   const fromApi = gainMultiplierToPercent(rawGain);
 
   if (fromDeposits != null) {
@@ -189,17 +212,17 @@ function resolveHeadlineGainPercent(rawGain, profit, deposits, withdrawals) {
     return fromDeposits;
   }
 
-  return fromApi;
+  return sanitizeAccountGainPercent(fromApi);
 }
 
 function resolveAbsoluteGainPercent(rawAbsGain, balance, profit, deposits, withdrawals) {
   const fromBalance = deriveAbsoluteGainPercent(balance, deposits, withdrawals);
   if (fromBalance != null) return fromBalance;
 
-  const fromProfit = deriveGainPercentFromDeposits(profit, deposits, withdrawals);
+  const fromProfit = deriveGainPercentFromDeposits(profit, deposits, withdrawals, balance);
   if (fromProfit != null) return fromProfit;
 
-  return gainMultiplierToPercent(rawAbsGain);
+  return sanitizeAccountGainPercent(gainMultiplierToPercent(rawAbsGain));
 }
 
 /** @deprecated Use compoundRateToPercent or gainMultiplierToPercent */
@@ -445,7 +468,7 @@ function mapMetaStatsToAccountMetrics(body) {
   const balance = coerceNumber(raw.balance);
 
   const mapped = {
-    gain: resolveHeadlineGainPercent(raw.gain, profit, deposits, withdrawals),
+    gain: resolveHeadlineGainPercent(raw.gain, profit, deposits, withdrawals, balance),
     metaapi_abs_gain: resolveAbsoluteGainPercent(
       raw.absoluteGain,
       balance,

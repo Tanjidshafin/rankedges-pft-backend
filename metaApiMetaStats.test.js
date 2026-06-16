@@ -75,6 +75,10 @@ describe('deriveGainPercentFromDeposits', () => {
     assert.equal(deriveGainPercentFromDeposits(-15.35, 1000), -1.53);
   });
 
+  it('returns null when net deposits below minimum floor', () => {
+    assert.equal(deriveGainPercentFromDeposits(-100, 0.01, 0, 1000), null);
+  });
+
   it('computes absolute gain from balance and deposits', () => {
     assert.equal(deriveAbsoluteGainPercent(1010.08, 1000), 1.01);
   });

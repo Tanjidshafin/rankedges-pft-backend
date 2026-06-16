@@ -26,12 +26,16 @@ const {
   deployProvisioningAccount,
   waitForProvisioningDeployed,
 } = require('./metaApiProvisioningFeatures');
-const { buildLeaderboardMetricUpdate } = require('./contestGainMetrics');
+const { buildLeaderboardMetricUpdate, sanitizeContestGainPercent, resolveGainBasis } = require('./contestGainMetrics');
 const { compareContestLeaderboardEntries, resolveLeaderboardScore, sortContestLeaderboardEntries, resolveLeaderboardEntryScore } = require('./contestRanking');
 const { rank3v3LeaderboardEntries } = require('./contestRanking3v3');
 const { rank1v1LeaderboardEntries } = require('./contestRanking1v1');
 const { refreshGlobalLeaderboardsInternal } = require('./globalLeaderboard');
-const { loadContestScopedMetricsForEntry } = require('./contestScopedMetrics');
+const {
+  loadContestScopedMetricsForEntry,
+  buildContestScopedMetricsFromMetaApi,
+  getContestRangeEndIso,
+} = require('./contestScopedMetrics');
 const { assertMetaApiCloudAccountId } = require('./metaApiProvisioningId');
 const { provisionInvestorMetaApiAccount } = require('./metaApiProvisionInvestor');
 const {
@@ -133,7 +137,7 @@ const ACHIEVEMENT_CRON_PAGE_SIZE = Math.max(
 );
 const CONTEST_RANKING_CRON_ENABLED =
   String(process.env.CONTEST_RANKING_CRON_ENABLED ?? 'true').toLowerCase() === 'true';
-const CONTEST_RANKING_CRON_SCHEDULE = process.env.CONTEST_RANKING_CRON_SCHEDULE || '*/1 * * * *';
+const CONTEST_RANKING_CRON_SCHEDULE = process.env.CONTEST_RANKING_CRON_SCHEDULE || '*/10 * * * *';
 const CONTEST_RANKING_CRON_TIMEZONE =
   process.env.CONTEST_RANKING_CRON_TIMEZONE || INTERNAL_CRON_TIMEZONE;
 const GLOBAL_LEADERBOARD_CRON_ENABLED =
@@ -1205,7 +1209,10 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
       mappedMetrics.equity != null && Number.isFinite(mappedMetrics.equity)
         ? mappedMetrics.equity
         : Number(accountInfo.equity || 0);
-    const headlineGain = mappedMetrics.gain != null && Number.isFinite(mappedMetrics.gain) ? mappedMetrics.gain : 0;
+    const headlineGain =
+      mappedMetrics.gain != null && Number.isFinite(mappedMetrics.gain)
+        ? sanitizeContestGainPercent(mappedMetrics.gain)
+        : 0;
     const headlineDd = mappedMetrics.dd != null && Number.isFinite(mappedMetrics.dd) ? mappedMetrics.dd : 0;
     const headlineProfit =
       mappedMetrics.profit != null && Number.isFinite(mappedMetrics.profit) ? mappedMetrics.profit : 0;
@@ -1232,7 +1239,7 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
       total_trades: headlineTotalTrades,
       metaapi_abs_gain:
         mappedMetrics.metaapi_abs_gain != null && Number.isFinite(mappedMetrics.metaapi_abs_gain)
-          ? mappedMetrics.metaapi_abs_gain
+          ? sanitizeContestGainPercent(mappedMetrics.metaapi_abs_gain)
           : null,
       metaapi_daily_gain:
         mappedMetrics.metaapi_daily_gain != null && Number.isFinite(mappedMetrics.metaapi_daily_gain)
@@ -2068,22 +2075,28 @@ async function syncAccountToContestData(accountId, options = {}) {
       },
     });
 
-    await lbDoc.ref.set(
-      {
-        gain: metrics.gain,
-        dd: metrics.dd,
-        profit: metrics.profit,
-        balance: metrics.balance,
-        equity: metrics.equity,
-        score: metrics.score,
-        total_lot: metrics.total_lot ?? entry.total_lot ?? 0,
-        peak_equity: metrics.peak_equity,
-        lowest_equity: metrics.lowest_equity,
-        score_updated_by: 'user_account_sync',
-        updatedAt: FieldValue.serverTimestamp(),
-      },
-      { merge: true },
-    );
+      await lbDoc.ref.set(
+        {
+          gain: sanitizeContestGainPercent(metrics.gain),
+          dd: metrics.dd,
+          profit: metrics.profit,
+          balance: metrics.balance,
+          equity: metrics.equity,
+          score: sanitizeContestGainPercent(metrics.score),
+          total_lot: metrics.total_lot ?? entry.total_lot ?? 0,
+          peak_equity: metrics.peak_equity,
+          lowest_equity: metrics.lowest_equity,
+          ...(metrics.resolved_baseline > 0
+            ? {
+                starting_balance: metrics.resolved_baseline,
+                starting_equity: metrics.resolved_baseline,
+              }
+            : {}),
+          score_updated_by: 'user_account_sync',
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
 
     const partSnap = await db
       .collection(COLLECTIONS.contestParticipations)
@@ -2135,6 +2148,344 @@ async function syncAccountToContestData(accountId, options = {}) {
   }
 
   return [...affectedContestIds];
+}
+
+async function fetchLiveMetaStatsAccountSnapshot(account, settings) {
+  const tokenCandidates = resolveMetaApiTokenCandidates(account, settings);
+  if (!account.metaapi_account_id || tokenCandidates.length === 0) {
+    throw new Error(`MetaApi credentials missing for account ${account.login || account.id}.`);
+  }
+
+  const metaapiCloudAccountId = assertMetaApiCloudAccountId(account.metaapi_account_id, account.login);
+  const accountForMetaApi = { ...account, metaapi_account_id: metaapiCloudAccountId };
+
+  const { token, data: regionPayload } = await requestMetaApiAccountDetailsWithTokens(
+    metaapiCloudAccountId,
+    tokenCandidates,
+  );
+  assertProvisioningReadyForClientApi(regionPayload, metaapiCloudAccountId);
+  const region = resolveMetaApiHostedRegion(regionPayload, accountForMetaApi);
+
+  const accountInfo = await fetchMetaApiAccountInfo(accountForMetaApi, token, region);
+  const metaStatsRaw = await fetchMetaStatsWithProvisioningRecovery(metaapiCloudAccountId, token, region);
+  const mappedMetrics = mapMetaStatsToAccountMetrics(metaStatsRaw);
+
+  const balance =
+    mappedMetrics.balance != null && Number.isFinite(mappedMetrics.balance)
+      ? mappedMetrics.balance
+      : Number(accountInfo.balance || 0);
+  const equity =
+    mappedMetrics.equity != null && Number.isFinite(mappedMetrics.equity)
+      ? mappedMetrics.equity
+      : Number(accountInfo.equity || balance);
+
+  const platform =
+    account.platform === 'mt4' || account.platform === 'mt5'
+      ? account.platform
+      : accountInfo.platform === 'mt4' || accountInfo.platform === 'mt5'
+        ? accountInfo.platform
+        : 'mt5';
+
+  return {
+    liveAccount: {
+      balance,
+      equity,
+      gain: mappedMetrics.gain ?? 0,
+      dd: mappedMetrics.dd ?? 0,
+      profit: mappedMetrics.profit ?? 0,
+    },
+    token,
+    region,
+    metaapiCloudAccountId,
+    platform,
+  };
+}
+
+/**
+ * Manual admin sync: refresh all contest participants from live MetaStats + MetaApi (not Firestore trades).
+ */
+async function syncContestFromMetaApiInternal(contestId) {
+  const contestSnap = await db.collection(COLLECTIONS.contests).doc(String(contestId)).get();
+  if (!contestSnap.exists) {
+    throw new Error('Contest not found');
+  }
+
+  const contest = { id: contestSnap.id, ...contestSnap.data() };
+  if (contest.type === 'pft') {
+    throw new Error('PFT contests use batch capture; use the PFT tab to refresh standings.');
+  }
+  if (contest.rankings_locked) {
+    throw new Error('Rankings are locked for this contest.');
+  }
+
+  const status = normalizeContestStatus(contest.status);
+  const syncAllowed =
+    status === 'published' || status === 'ongoing' || (status === 'completed' && !contest.rankings_locked);
+  if (!syncAllowed) {
+    throw new Error('Contest must be published, ongoing, or completed (with rankings unlocked) to sync standings.');
+  }
+
+  const settings = await getSiteSettings();
+  const lbSnap = await db
+    .collection(COLLECTIONS.leaderboard)
+    .where('contest_id', '==', String(contestId))
+    .get();
+
+  const rangeEndIso = getContestRangeEndIso(contest);
+  const gainBasis = resolveGainBasis(contest);
+  const needsDealHistory = contest.type === 'standard' || gainBasis === 'balance';
+
+  const results = {
+    ok: true,
+    contestId: String(contestId),
+    participants: 0,
+    synced: 0,
+    failed: 0,
+    errors: [],
+  };
+
+  for (const lbDoc of lbSnap.docs) {
+    const entry = { id: lbDoc.id, ...lbDoc.data() };
+    if (entry.participant_status === 'disqualified' || entry.participant_status === 'withdrawn') {
+      continue;
+    }
+    if (!entry.account_id) {
+      results.failed += 1;
+      results.errors.push({
+        userId: entry.user_id || null,
+        message: 'Leaderboard entry has no linked trading account.',
+      });
+      continue;
+    }
+
+    results.participants += 1;
+
+    const accountSnap = await db.collection(COLLECTIONS.accounts).doc(String(entry.account_id)).get();
+    if (!accountSnap.exists) {
+      results.failed += 1;
+      results.errors.push({
+        accountId: entry.account_id,
+        message: 'Trading account not found.',
+      });
+      continue;
+    }
+
+    try {
+      const account = { id: accountSnap.id, ...accountSnap.data() };
+      const live = await fetchLiveMetaStatsAccountSnapshot(account, settings);
+
+      let rawDeals = [];
+      if (needsDealHistory) {
+        const clientApiUrl = getClientApiUrl(live.region);
+        rawDeals = await fetchMetaApiHistoryDealsPaginated(
+          clientApiUrl,
+          live.metaapiCloudAccountId,
+          live.token,
+          contest.start_at,
+          rangeEndIso,
+        );
+      }
+
+      const metrics = buildContestScopedMetricsFromMetaApi(
+        contest,
+        live.liveAccount,
+        entry,
+        rawDeals,
+        live.platform,
+      );
+
+      await lbDoc.ref.set(
+        {
+          gain: sanitizeContestGainPercent(metrics.gain),
+          dd: metrics.dd,
+          profit: metrics.profit,
+          balance: metrics.balance,
+          equity: metrics.equity,
+          score: sanitizeContestGainPercent(metrics.score),
+          total_lot: metrics.total_lot ?? entry.total_lot ?? 0,
+          peak_equity: metrics.peak_equity,
+          lowest_equity: metrics.lowest_equity,
+          ...(metrics.resolved_baseline > 0
+            ? {
+                starting_balance: metrics.resolved_baseline,
+                starting_equity: metrics.resolved_baseline,
+              }
+            : {}),
+          score_updated_by: 'admin_metastats_sync',
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+
+      const partSnap = await db
+        .collection(COLLECTIONS.contestParticipations)
+        .where('contest_id', '==', String(contestId))
+        .where('user_id', '==', entry.user_id)
+        .get();
+      const partBatch = db.batch();
+      partSnap.docs.forEach((partDoc) => {
+        partBatch.set(
+          partDoc.ref,
+          {
+            current_balance: metrics.balance,
+            current_equity: metrics.equity,
+            peak_equity: metrics.peak_equity,
+            lowest_equity: metrics.lowest_equity,
+            updatedAt: FieldValue.serverTimestamp(),
+          },
+          { merge: true },
+        );
+      });
+      await partBatch.commit();
+
+      const maxDd = contest.max_dd_rule ?? contest.dd_cap;
+      if (maxDd && maxDd > 0 && metrics.dd >= maxDd) {
+        await lbDoc.ref.set(
+          { participant_status: 'disqualified', updatedAt: FieldValue.serverTimestamp() },
+          { merge: true },
+        );
+        partSnap.docs.forEach((partDoc) => {
+          partDoc.ref.set(
+            {
+              participant_status: 'disqualified',
+              disqualified_at: new Date().toISOString(),
+              disqualified_reason: 'Maximum drawdown exceeded',
+              updatedAt: FieldValue.serverTimestamp(),
+            },
+            { merge: true },
+          );
+        });
+      }
+
+      results.synced += 1;
+    } catch (err) {
+      results.failed += 1;
+      results.errors.push({
+        accountId: entry.account_id,
+        login: accountSnap.data()?.login || null,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  await updateContestRankingsServer(String(contestId));
+  return results;
+}
+
+async function repairContestBaselinesInternal(contestId) {
+  const contestSnap = await db.collection(COLLECTIONS.contests).doc(String(contestId)).get();
+  if (!contestSnap.exists) {
+    throw new Error('Contest not found');
+  }
+  const contest = { id: contestSnap.id, ...contestSnap.data() };
+
+  const lbSnap = await db
+    .collection(COLLECTIONS.leaderboard)
+    .where('contest_id', '==', String(contestId))
+    .get();
+
+  let baselinesRepaired = 0;
+  const accountIds = new Set();
+
+  for (const lbDoc of lbSnap.docs) {
+    const entry = lbDoc.data();
+    const startingBalance = Number(entry.starting_balance) || 0;
+    if (startingBalance > 0) {
+      if (entry.account_id) accountIds.add(String(entry.account_id));
+      continue;
+    }
+
+    let balance = 0;
+    let equity = 0;
+
+    const partSnap = await db
+      .collection(COLLECTIONS.contestParticipations)
+      .where('contest_id', '==', String(contestId))
+      .where('user_id', '==', entry.user_id)
+      .limit(1)
+      .get();
+
+    if (!partSnap.empty) {
+      const part = partSnap.docs[0].data();
+      balance = Number(part.starting_balance) || 0;
+      equity = Number(part.starting_equity ?? balance) || balance;
+    }
+
+    if (balance <= 0 && entry.account_id) {
+      const accountSnap = await db.collection(COLLECTIONS.accounts).doc(String(entry.account_id)).get();
+      if (accountSnap.exists) {
+        const account = accountSnap.data();
+        balance = Number(account.balance ?? 0);
+        equity = Number(account.equity ?? balance);
+      }
+    }
+
+    if (balance <= 0) {
+      console.warn('[repair-contest-baselines] could not resolve baseline', {
+        contestId,
+        userId: entry.user_id,
+        accountId: entry.account_id,
+      });
+      continue;
+    }
+
+    const gainBasis = contest.gain_basis === 'equity' ? 'equity' : 'balance';
+    const watermark = gainBasis === 'equity' ? equity : balance;
+
+    await lbDoc.ref.set(
+      {
+        starting_balance: balance,
+        starting_equity: equity,
+        peak_equity: watermark,
+        lowest_equity: watermark,
+        balance,
+        equity,
+        gain: 0,
+        dd: 0,
+        score: 0,
+        updatedAt: FieldValue.serverTimestamp(),
+      },
+      { merge: true },
+    );
+
+    if (!partSnap.empty) {
+      await partSnap.docs[0].ref.set(
+        {
+          starting_balance: balance,
+          starting_equity: equity,
+          current_balance: balance,
+          current_equity: equity,
+          peak_equity: watermark,
+          lowest_equity: watermark,
+          updatedAt: FieldValue.serverTimestamp(),
+        },
+        { merge: true },
+      );
+    }
+
+    baselinesRepaired += 1;
+    if (entry.account_id) accountIds.add(String(entry.account_id));
+  }
+
+  let metricsSynced = 0;
+  for (const accountId of accountIds) {
+    try {
+      await syncAccountToContestData(accountId, { skipRankingUpdate: true });
+      metricsSynced += 1;
+    } catch (err) {
+      console.warn('[repair-contest-baselines] sync failed', accountId, err instanceof Error ? err.message : err);
+    }
+  }
+
+  await updateContestRankingsServer(String(contestId));
+
+  return {
+    ok: true,
+    contestId: String(contestId),
+    baselinesRepaired,
+    metricsSynced,
+    accountsProcessed: accountIds.size,
+  };
 }
 
 async function updateContestRankingsServer(contestId, options = {}) {
@@ -3540,6 +3891,43 @@ app.post('/api/meta-api/admin/sync-all', requireAdminPermission('accounts'), asy
   } catch (error) {
     await clearAdminBulkSyncProgress();
     res.status(500).json({ error: error instanceof Error ? error.message : 'MetaApi sync-all failed.' });
+  }
+});
+
+app.post('/api/admin/repair-contest-baselines/:contestId', requireAdminPermission('contests'), async (req, res) => {
+  try {
+    const contestId = String(req.params.contestId || '').trim();
+    if (!contestId) {
+      res.status(400).json({ error: 'contestId is required.' });
+      return;
+    }
+    const result = await repairContestBaselinesInternal(contestId);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to repair contest baselines.',
+    });
+  }
+});
+
+app.post('/api/admin/contests/:contestId/sync-from-metastats', requireAdminPermission('contests'), async (req, res) => {
+  try {
+    const contestId = String(req.params.contestId || '').trim();
+    if (!contestId) {
+      res.status(400).json({ error: 'contestId is required.' });
+      return;
+    }
+    console.log(`[admin][contest-metastats-sync] start contestId=${contestId}`);
+    const result = await syncContestFromMetaApiInternal(contestId);
+    console.log(`[admin][contest-metastats-sync] done contestId=${contestId}`, {
+      synced: result.synced,
+      failed: result.failed,
+    });
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to sync contest from MetaStats.',
+    });
   }
 });
 

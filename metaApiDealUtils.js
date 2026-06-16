@@ -135,7 +135,7 @@ function deriveSyncedMetricsPackage(terminalBalance, rawDeals, platform) {
   }
 
   const metrics = calculateMetrics(normalizedTrades, syntheticStart);
-  return { normalizedTrades, metrics };
+  return { normalizedTrades, metrics, syntheticStart };
 }
 
 async function fetchMetaApiHistoryDealsPaginated(
@@ -214,6 +214,7 @@ function firestoreTradeDocToSnapshot(data) {
 
 /**
  * Derive headline activity metrics from persisted metaApiTrades rows (no MetaApi fetch).
+ * Uses synthetic start (terminal balance minus trade impacts), same as deriveSyncedMetricsPackage.
  * @param {object[]} tradeDocs plain Firestore trade payloads
  * @param {number} terminalBalance live or MetaStats balance for gain/dd baseline
  */
@@ -221,10 +222,15 @@ function deriveMetricsFromFirestoreTradeDocs(tradeDocs, terminalBalance) {
   const normalizedTrades = (Array.isArray(tradeDocs) ? tradeDocs : []).map((row) =>
     firestoreTradeDocToSnapshot(row),
   );
-  const initial =
-    Number.isFinite(terminalBalance) && terminalBalance > 0 ? Number(terminalBalance) : Number.EPSILON;
-  const metrics = calculateMetrics(normalizedTrades, initial);
-  return { normalizedTrades, metrics };
+  const tradingNetPeriod = normalizedTrades.reduce((sum, trade) => sum + tradeSnapshotNet(trade), 0);
+  const terminal = Number(terminalBalance);
+  let syntheticStart = Number.isFinite(terminal) ? terminal - tradingNetPeriod : 0;
+  if (!Number.isFinite(syntheticStart) || syntheticStart <= 0) {
+    syntheticStart = Number.isFinite(terminal) && terminal > 0 ? terminal : 0;
+  }
+
+  const metrics = calculateMetrics(normalizedTrades, syntheticStart > 0 ? syntheticStart : 1);
+  return { normalizedTrades, metrics, syntheticStart: syntheticStart > 0 ? syntheticStart : 0 };
 }
 
 module.exports = {
