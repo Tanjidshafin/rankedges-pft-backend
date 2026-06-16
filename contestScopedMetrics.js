@@ -1,18 +1,11 @@
 /**
- * Contest-window metrics from persisted Firestore trades (server-side).
+ * Contest leaderboard metrics: MetaStats gain + optional contest-window lot totals.
  */
 
-const {
-  buildLeaderboardMetricUpdate,
-  resolveGainBasis,
-  sanitizeContestGainPercent,
-  resolveContestGainBaseline,
-  contestGainPercentFromTradeMetrics,
-} = require('./contestGainMetrics');
+const { resolveGainBasis } = require('./contestGainMetrics');
+const { buildContestLeaderboardMetricsFromAccount } = require('./contestMetaStatsGain');
 const { resolveLeaderboardScore } = require('./contestRanking');
 const {
-  deriveMetricsFromFirestoreTradeDocs,
-  deriveSyncedMetricsPackage,
   filterDealsForMetrics,
   metaApiDealToTradeSnapshot,
   firestoreTradeDocToSnapshot,
@@ -63,154 +56,52 @@ function sumLotsFromMetaApiDeals(rawDeals, platform) {
   return sumTotalLot(metricDeals.map((deal) => metaApiDealToTradeSnapshot(deal)));
 }
 
-function entryFieldsFromLeaderboard(entry) {
+function contestNeedsLotTotals(contest) {
+  const gainBasis = resolveGainBasis(contest);
+  return contest.type === 'standard' || gainBasis === 'balance';
+}
+
+function resolveContestWindowLots(contest, tradeDocs) {
+  if (!contestNeedsLotTotals(contest)) return 0;
+  const rangeEndIso = getContestRangeEndIso(contest);
+  const filteredTrades = filterTradesInRange(tradeDocs, contest.start_at, rangeEndIso);
+  return sumTotalLot(filteredTrades);
+}
+
+function finalizeContestMetrics(contest, account, entry, totalLot, options = {}) {
+  const built = buildContestLeaderboardMetricsFromAccount(contest, account, {
+    totalLot,
+    entry,
+    requireSyncedAt: options.requireSyncedAt,
+  });
+  if (!built.ok) {
+    return built;
+  }
   return {
-    starting_balance: entry.starting_balance,
-    starting_equity: entry.starting_equity,
-    peak_equity: entry.peak_equity,
-    lowest_equity: entry.lowest_equity,
+    ok: true,
+    metrics: {
+      ...built.metrics,
+      score: resolveLeaderboardScore(contest, built.metrics, totalLot),
+    },
   };
 }
 
 /**
- * Contest metrics using live MetaStats/MetaApi deal history (not Firestore trades).
- * @param {object} contest
- * @param {{ balance: number, equity: number, gain?: number, dd?: number, profit?: number }} liveAccount
- * @param {object} entry leaderboard row
- * @param {object[]} rawDeals MetaApi history deals in contest window (may be empty)
- * @param {'mt4'|'mt5'} platform
+ * Metrics from persisted Firestore account + optional contest-window lots from trade docs.
  */
-function buildBalanceBasisContestGainFromTrades(metricsPackage, entry, terminalValue) {
-  const resolvedBaseline = resolveContestGainBaseline(
-    entry.starting_balance,
-    metricsPackage.syntheticStart,
-    terminalValue,
-  );
-  return {
-    gain: contestGainPercentFromTradeMetrics(metricsPackage.metrics, resolvedBaseline),
-    resolvedBaseline,
-  };
-}
-
-function buildContestScopedMetricsFromMetaApi(contest, liveAccount, entry, rawDeals, platform) {
-  const gainBasis = resolveGainBasis(contest);
-  const needsLotData = contest.type === 'standard' || gainBasis === 'balance';
-  const fields = entryFieldsFromLeaderboard(entry);
-  const deals = Array.isArray(rawDeals) ? rawDeals : [];
-  const totalLot = needsLotData ? sumLotsFromMetaApiDeals(deals, platform) : 0;
-
-  if (!needsLotData) {
-    const base = buildLeaderboardMetricUpdate({ contest, account: liveAccount, entry: fields });
-    return {
-      ...base,
-      total_lot: 0,
-      score: resolveLeaderboardScore(contest, base, 0),
-    };
-  }
-
-  if (gainBasis === 'equity') {
-    const terminalEquity = Number(liveAccount.equity) || Number(liveAccount.balance) || 0;
-    const metricsPackage = deriveSyncedMetricsPackage(terminalEquity, deals, platform);
-    const resolvedEquityBaseline = resolveContestGainBaseline(
-      entry.starting_equity ?? entry.starting_balance,
-      metricsPackage.syntheticStart,
-      terminalEquity,
-    );
-    const repairedFields = {
-      ...fields,
-      ...(resolvedEquityBaseline > 0
-        ? { starting_equity: resolvedEquityBaseline, starting_balance: resolvedEquityBaseline }
-        : {}),
-    };
-    const base = buildLeaderboardMetricUpdate({ contest, account: liveAccount, entry: repairedFields });
-    return {
-      ...base,
-      total_lot: totalLot,
-      score: resolveLeaderboardScore(contest, base, totalLot),
-      resolved_baseline: resolvedEquityBaseline > 0 ? resolvedEquityBaseline : undefined,
-    };
-  }
-
-  const terminalBalance = Number(liveAccount.balance) || Number(entry.starting_balance) || 0;
-  const metricsPackage = deriveSyncedMetricsPackage(terminalBalance, deals, platform);
-  const { gain: contestScopedGain, resolvedBaseline } = buildBalanceBasisContestGainFromTrades(
-    metricsPackage,
-    entry,
-    terminalBalance,
-  );
-
-  const scoped = buildLeaderboardMetricUpdate({
-    contest,
-    account: liveAccount,
-    entry: fields,
-    contestScopedGain,
-    contestScopedProfit: metricsPackage.metrics.profit,
-    contestScopedDd: metricsPackage.metrics.dd,
-  });
-
-  return {
-    ...scoped,
-    total_lot: totalLot,
-    score: resolveLeaderboardScore(contest, scoped, totalLot),
-    resolved_baseline: resolvedBaseline > 0 ? resolvedBaseline : undefined,
-  };
-}
-
 function buildContestScopedMetrics(contest, account, entry, tradeDocs) {
-  const gainBasis = resolveGainBasis(contest);
-  const needsLotData = contest.type === 'standard' || gainBasis === 'balance';
-  const base = buildLeaderboardMetricUpdate({ contest, account, entry });
+  const totalLot = resolveContestWindowLots(contest, tradeDocs);
+  return finalizeContestMetrics(contest, account, entry, totalLot);
+}
 
-  if (!needsLotData) {
-    return {
-      ...base,
-      total_lot: 0,
-      score: resolveLeaderboardScore(contest, base, 0),
-    };
-  }
-
-  const rangeEndIso = getContestRangeEndIso(contest);
-  const startIso = contest.start_at;
-  const filteredTrades = filterTradesInRange(tradeDocs, startIso, rangeEndIso);
-  const totalLot = sumTotalLot(filteredTrades);
-
-  if (filteredTrades.length === 0) {
-    return {
-      ...base,
-      total_lot: totalLot,
-      score: resolveLeaderboardScore(contest, base, totalLot),
-    };
-  }
-
-  if (gainBasis === 'equity') {
-    return {
-      ...base,
-      total_lot: totalLot,
-      score: resolveLeaderboardScore(contest, base, totalLot),
-    };
-  }
-
-  const terminalBalance = Number(account.balance) || Number(entry.starting_balance) || 0;
-  const metricsPackage = deriveMetricsFromFirestoreTradeDocs(filteredTrades, terminalBalance);
-  const { gain: contestScopedGain, resolvedBaseline } = buildBalanceBasisContestGainFromTrades(
-    metricsPackage,
-    entry,
-    terminalBalance,
-  );
-
-  const scoped = {
-    ...base,
-    gain: contestScopedGain,
-    dd: metricsPackage.metrics.dd,
-    profit: metricsPackage.metrics.profit,
-    total_lot: totalLot,
-    resolved_baseline: resolvedBaseline > 0 ? resolvedBaseline : undefined,
-  };
-
-  return {
-    ...scoped,
-    score: resolveLeaderboardScore(contest, scoped, totalLot),
-  };
+/**
+ * Metrics from live MetaStats account snapshot + optional MetaApi deals for contest-window lots.
+ */
+function buildContestScopedMetricsFromMetaApi(contest, liveAccount, entry, rawDeals, platform) {
+  const totalLot = contestNeedsLotTotals(contest)
+    ? sumLotsFromMetaApiDeals(rawDeals, platform)
+    : 0;
+  return finalizeContestMetrics(contest, liveAccount, entry, totalLot, { requireSyncedAt: false });
 }
 
 async function loadFirestoreTradesForAccount(db, collections, account) {
@@ -247,6 +138,7 @@ module.exports = {
   getContestRangeEndIso,
   filterTradesInRange,
   sumTotalLot,
+  contestNeedsLotTotals,
   buildContestScopedMetrics,
   buildContestScopedMetricsFromMetaApi,
   loadFirestoreTradesForAccount,

@@ -12,6 +12,7 @@ const {
 const {
   fetchMetaStatsMetrics,
   mapMetaStatsToAccountMetrics,
+  deriveGainPercentFromDeposits,
   isMetaStatsActivityEmpty,
   mergeActivityMetricsInto,
   safeJsonSnippet,
@@ -26,7 +27,7 @@ const {
   deployProvisioningAccount,
   waitForProvisioningDeployed,
 } = require('./metaApiProvisioningFeatures');
-const { buildLeaderboardMetricUpdate, sanitizeContestGainPercent, resolveGainBasis } = require('./contestGainMetrics');
+const { sanitizeContestGainPercent, resolveGainBasis } = require('./contestGainMetrics');
 const { compareContestLeaderboardEntries, resolveLeaderboardScore, sortContestLeaderboardEntries, resolveLeaderboardEntryScore } = require('./contestRanking');
 const { rank3v3LeaderboardEntries } = require('./contestRanking3v3');
 const { rank1v1LeaderboardEntries } = require('./contestRanking1v1');
@@ -35,6 +36,7 @@ const {
   loadContestScopedMetricsForEntry,
   buildContestScopedMetricsFromMetaApi,
   getContestRangeEndIso,
+  contestNeedsLotTotals,
 } = require('./contestScopedMetrics');
 const { assertMetaApiCloudAccountId } = require('./metaApiProvisioningId');
 const { provisionInvestorMetaApiAccount } = require('./metaApiProvisionInvestor');
@@ -1209,13 +1211,18 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
       mappedMetrics.equity != null && Number.isFinite(mappedMetrics.equity)
         ? mappedMetrics.equity
         : Number(accountInfo.equity || 0);
+    const depositDerivedGain = deriveGainPercentFromDeposits(
+      mappedMetrics.profit,
+      mappedMetrics.metaapi_deposits,
+      mappedMetrics.metaapi_withdrawals,
+      headlineBalance,
+    );
     const headlineGain =
-      mappedMetrics.gain != null && Number.isFinite(mappedMetrics.gain)
-        ? sanitizeContestGainPercent(mappedMetrics.gain)
-        : 0;
-    const headlineDd = mappedMetrics.dd != null && Number.isFinite(mappedMetrics.dd) ? mappedMetrics.dd : 0;
+      depositDerivedGain != null ? sanitizeContestGainPercent(depositDerivedGain) : null;
+    const headlineDd =
+      mappedMetrics.dd != null && Number.isFinite(mappedMetrics.dd) ? mappedMetrics.dd : null;
     const headlineProfit =
-      mappedMetrics.profit != null && Number.isFinite(mappedMetrics.profit) ? mappedMetrics.profit : 0;
+      mappedMetrics.profit != null && Number.isFinite(mappedMetrics.profit) ? mappedMetrics.profit : null;
     const headlineWin =
       mappedMetrics.win_rate != null && Number.isFinite(mappedMetrics.win_rate) ? mappedMetrics.win_rate : 0;
     const headlineTotalTrades =
@@ -1232,9 +1239,9 @@ async function syncMetaApiAccountSnapshot(account, requestedBy = 'scheduled', op
     const persistMeta = {
       balance: headlineBalance,
       equity: headlineEquity,
-      gain: headlineGain,
-      dd: headlineDd,
-      profit: headlineProfit,
+      ...(headlineGain != null ? { gain: headlineGain } : {}),
+      ...(headlineDd != null ? { dd: headlineDd } : {}),
+      ...(headlineProfit != null ? { profit: headlineProfit } : {}),
       win_rate: headlineWin,
       total_trades: headlineTotalTrades,
       metaapi_abs_gain:
@@ -2042,17 +2049,27 @@ function calculateContestScore(gain, dd, profit, balance, scoringMode) {
 }
 
 async function syncAccountToContestData(accountId, options = {}) {
-  const { skipRankingUpdate = false } = options;
+  const {
+    skipRankingUpdate = false,
+    scoreUpdatedBy = 'user_account_sync',
+    contestId: onlyContestId = null,
+    includeCompleted = false,
+  } = options;
   const accountSnap = await db.collection(COLLECTIONS.accounts).doc(String(accountId)).get();
-  if (!accountSnap.exists) return [];
+  if (!accountSnap.exists) return { contestIds: [], synced: 0, skipped: 0 };
   const account = { id: accountSnap.id, ...accountSnap.data() };
 
   const lbSnap = await db.collection(COLLECTIONS.leaderboard).where('account_id', '==', String(accountId)).get();
   const affectedContestIds = new Set();
+  let synced = 0;
+  let skipped = 0;
 
   for (const lbDoc of lbSnap.docs) {
     const entry = { id: lbDoc.id, ...lbDoc.data() };
     if (entry.participant_status === 'disqualified' || entry.participant_status === 'withdrawn') {
+      continue;
+    }
+    if (onlyContestId && String(entry.contest_id) !== String(onlyContestId)) {
       continue;
     }
 
@@ -2060,11 +2077,11 @@ async function syncAccountToContestData(accountId, options = {}) {
     if (!contestSnap.exists) continue;
     const contest = contestSnap.data();
     if (contest.type === 'pft') continue;
-    if (normalizeContestStatus(contest.status) === 'completed') continue;
+    if (!includeCompleted && normalizeContestStatus(contest.status) === 'completed') continue;
     if (contest.rankings_locked) continue;
 
     const startingBalance = Number(entry.starting_balance) || 0;
-    const metrics = await loadContestScopedMetricsForEntry(db, COLLECTIONS, {
+    const metricsResult = await loadContestScopedMetricsForEntry(db, COLLECTIONS, {
       contest,
       account,
       entry: {
@@ -2074,6 +2091,19 @@ async function syncAccountToContestData(accountId, options = {}) {
         lowest_equity: entry.lowest_equity,
       },
     });
+
+    if (!metricsResult.ok) {
+      console.warn(
+        '[contest-sync] skip leaderboard metrics update',
+        accountId,
+        entry.contest_id,
+        metricsResult.reason,
+      );
+      skipped += 1;
+      continue;
+    }
+
+    const metrics = metricsResult.metrics;
 
       await lbDoc.ref.set(
         {
@@ -2086,13 +2116,7 @@ async function syncAccountToContestData(accountId, options = {}) {
           total_lot: metrics.total_lot ?? entry.total_lot ?? 0,
           peak_equity: metrics.peak_equity,
           lowest_equity: metrics.lowest_equity,
-          ...(metrics.resolved_baseline > 0
-            ? {
-                starting_balance: metrics.resolved_baseline,
-                starting_equity: metrics.resolved_baseline,
-              }
-            : {}),
-          score_updated_by: 'user_account_sync',
+          score_updated_by: scoreUpdatedBy,
           updatedAt: FieldValue.serverTimestamp(),
         },
         { merge: true },
@@ -2139,6 +2163,7 @@ async function syncAccountToContestData(accountId, options = {}) {
     }
 
     affectedContestIds.add(String(entry.contest_id));
+    synced += 1;
   }
 
   if (!skipRankingUpdate) {
@@ -2147,7 +2172,7 @@ async function syncAccountToContestData(accountId, options = {}) {
     }
   }
 
-  return [...affectedContestIds];
+  return { contestIds: [...affectedContestIds], synced, skipped };
 }
 
 async function fetchLiveMetaStatsAccountSnapshot(account, settings) {
@@ -2190,9 +2215,12 @@ async function fetchLiveMetaStatsAccountSnapshot(account, settings) {
     liveAccount: {
       balance,
       equity,
-      gain: mappedMetrics.gain ?? 0,
-      dd: mappedMetrics.dd ?? 0,
-      profit: mappedMetrics.profit ?? 0,
+      gain: mappedMetrics.gain ?? null,
+      dd: mappedMetrics.dd ?? null,
+      profit: mappedMetrics.profit ?? null,
+      metaapi_deposits: mappedMetrics.metaapi_deposits ?? null,
+      metaapi_withdrawals: mappedMetrics.metaapi_withdrawals ?? null,
+      metaapi_metrics_synced_at: new Date().toISOString(),
     },
     token,
     region,
@@ -2232,14 +2260,14 @@ async function syncContestFromMetaApiInternal(contestId) {
     .get();
 
   const rangeEndIso = getContestRangeEndIso(contest);
-  const gainBasis = resolveGainBasis(contest);
-  const needsDealHistory = contest.type === 'standard' || gainBasis === 'balance';
+  const needsLots = contestNeedsLotTotals(contest);
 
   const results = {
     ok: true,
     contestId: String(contestId),
     participants: 0,
     synced: 0,
+    skipped: 0,
     failed: 0,
     errors: [],
   };
@@ -2275,7 +2303,7 @@ async function syncContestFromMetaApiInternal(contestId) {
       const live = await fetchLiveMetaStatsAccountSnapshot(account, settings);
 
       let rawDeals = [];
-      if (needsDealHistory) {
+      if (needsLots) {
         const clientApiUrl = getClientApiUrl(live.region);
         rawDeals = await fetchMetaApiHistoryDealsPaginated(
           clientApiUrl,
@@ -2286,13 +2314,25 @@ async function syncContestFromMetaApiInternal(contestId) {
         );
       }
 
-      const metrics = buildContestScopedMetricsFromMetaApi(
+      const metricsResult = buildContestScopedMetricsFromMetaApi(
         contest,
-        live.liveAccount,
+        { ...account, ...live.liveAccount },
         entry,
         rawDeals,
         live.platform,
       );
+
+      if (!metricsResult.ok) {
+        results.skipped += 1;
+        results.errors.push({
+          accountId: entry.account_id,
+          userId: entry.user_id || null,
+          message: `Skipped metrics update: ${metricsResult.reason}`,
+        });
+        continue;
+      }
+
+      const metrics = metricsResult.metrics;
 
       await lbDoc.ref.set(
         {
@@ -2305,12 +2345,6 @@ async function syncContestFromMetaApiInternal(contestId) {
           total_lot: metrics.total_lot ?? entry.total_lot ?? 0,
           peak_equity: metrics.peak_equity,
           lowest_equity: metrics.lowest_equity,
-          ...(metrics.resolved_baseline > 0
-            ? {
-                starting_balance: metrics.resolved_baseline,
-                starting_equity: metrics.resolved_baseline,
-              }
-            : {}),
           score_updated_by: 'admin_metastats_sync',
           updatedAt: FieldValue.serverTimestamp(),
         },
@@ -2363,6 +2397,97 @@ async function syncContestFromMetaApiInternal(contestId) {
       results.errors.push({
         accountId: entry.account_id,
         login: accountSnap.data()?.login || null,
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  await updateContestRankingsServer(String(contestId));
+  return results;
+}
+
+/**
+ * Manual admin sync: recompute standings from persisted Firestore accounts + stored trades (lots only).
+ */
+async function syncContestFromDbInternal(contestId) {
+  const contestSnap = await db.collection(COLLECTIONS.contests).doc(String(contestId)).get();
+  if (!contestSnap.exists) {
+    throw new Error('Contest not found');
+  }
+
+  const contest = { id: contestSnap.id, ...contestSnap.data() };
+  if (contest.type === 'pft') {
+    throw new Error('PFT contests use batch capture; use the PFT tab to refresh standings.');
+  }
+  if (contest.rankings_locked) {
+    throw new Error('Rankings are locked for this contest.');
+  }
+
+  const status = normalizeContestStatus(contest.status);
+  const syncAllowed =
+    status === 'published' || status === 'ongoing' || (status === 'completed' && !contest.rankings_locked);
+  if (!syncAllowed) {
+    throw new Error('Contest must be published, ongoing, or completed (with rankings unlocked) to sync standings.');
+  }
+
+  const lbSnap = await db
+    .collection(COLLECTIONS.leaderboard)
+    .where('contest_id', '==', String(contestId))
+    .get();
+
+  const accountIds = new Set();
+  const results = {
+    ok: true,
+    contestId: String(contestId),
+    participants: 0,
+    synced: 0,
+    skipped: 0,
+    failed: 0,
+    errors: [],
+  };
+
+  for (const lbDoc of lbSnap.docs) {
+    const entry = lbDoc.data();
+    if (entry.participant_status === 'disqualified' || entry.participant_status === 'withdrawn') {
+      continue;
+    }
+
+    results.participants += 1;
+
+    if (!entry.account_id) {
+      results.failed += 1;
+      results.errors.push({
+        userId: entry.user_id || null,
+        message: 'Leaderboard entry has no linked trading account.',
+      });
+      continue;
+    }
+
+    accountIds.add(String(entry.account_id));
+  }
+
+  const includeCompleted = status === 'completed';
+
+  for (const accountId of accountIds) {
+    try {
+      const outcome = await syncAccountToContestData(accountId, {
+        skipRankingUpdate: true,
+        scoreUpdatedBy: 'admin_db_sync',
+        contestId: String(contestId),
+        includeCompleted,
+      });
+      results.synced += outcome.synced;
+      results.skipped += outcome.skipped;
+      if (outcome.synced === 0) {
+        results.errors.push({
+          accountId,
+          message: 'Skipped — account missing MetaStats sync or deposit baseline for gain calculation.',
+        });
+      }
+    } catch (err) {
+      results.failed += 1;
+      results.errors.push({
+        accountId,
         message: err instanceof Error ? err.message : String(err),
       });
     }
@@ -2885,7 +3010,10 @@ async function refreshOngoingContestLeaderboards() {
       let metricsRefreshed = 0;
       for (const accountId of accountIds) {
         try {
-          await syncAccountToContestData(accountId, { skipRankingUpdate: true });
+          await syncAccountToContestData(accountId, {
+            skipRankingUpdate: true,
+            scoreUpdatedBy: 'contest_ranking_cron',
+          });
           metricsRefreshed += 1;
         } catch (syncError) {
           console.warn(
@@ -2916,7 +3044,7 @@ async function refreshOngoingContestLeaderboards() {
 
   return {
     ok: true,
-    mode: 'db_rerank_only',
+    mode: 'metastats_gain_sync',
     contests: results.length,
     results,
   };
@@ -3921,12 +4049,35 @@ app.post('/api/admin/contests/:contestId/sync-from-metastats', requireAdminPermi
     const result = await syncContestFromMetaApiInternal(contestId);
     console.log(`[admin][contest-metastats-sync] done contestId=${contestId}`, {
       synced: result.synced,
+      skipped: result.skipped,
       failed: result.failed,
     });
     res.json(result);
   } catch (error) {
     res.status(500).json({
       error: error instanceof Error ? error.message : 'Failed to sync contest from MetaStats.',
+    });
+  }
+});
+
+app.post('/api/admin/contests/:contestId/sync-from-db', requireAdminPermission('contests'), async (req, res) => {
+  try {
+    const contestId = String(req.params.contestId || '').trim();
+    if (!contestId) {
+      res.status(400).json({ error: 'contestId is required.' });
+      return;
+    }
+    console.log(`[admin][contest-db-sync] start contestId=${contestId}`);
+    const result = await syncContestFromDbInternal(contestId);
+    console.log(`[admin][contest-db-sync] done contestId=${contestId}`, {
+      synced: result.synced,
+      skipped: result.skipped,
+      failed: result.failed,
+    });
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Failed to sync contest from database.',
     });
   }
 });
@@ -4305,16 +4456,8 @@ app.post('/api/contests/:contestId/rerank-leaderboard', requireUser, async (req,
     const isCreator = contest.creator_id === uid;
 
     if (!isAdminUser && !isCreator) {
-      const partSnap = await db
-        .collection(COLLECTIONS.contestParticipations)
-        .where('contest_id', '==', contestId)
-        .where('user_id', '==', uid)
-        .limit(1)
-        .get();
-      if (partSnap.empty) {
-        res.status(403).json({ error: 'You are not enrolled in this contest.' });
-        return;
-      }
+      res.status(403).json({ error: 'Only admins or the contest creator can rerank standings.' });
+      return;
     }
 
     await updateContestRankingsServer(contestId);
@@ -4780,7 +4923,7 @@ function startInternalCronScheduler() {
       // Run once shortly after startup so ongoing contests get ranks without waiting for the first tick.
       setTimeout(runContestRankingCron, 15_000);
       console.log(
-        `Contest ranking cron enabled (timezone=${CONTEST_RANKING_CRON_TIMEZONE}, schedule='${CONTEST_RANKING_CRON_SCHEDULE}', mode=db_rerank_only).`,
+        `Contest ranking cron enabled (timezone=${CONTEST_RANKING_CRON_TIMEZONE}, schedule='${CONTEST_RANKING_CRON_SCHEDULE}', mode=metastats_gain_sync).`,
       );
     }
   } else {

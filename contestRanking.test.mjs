@@ -72,13 +72,23 @@ describe('contestScopedMetrics', () => {
       start_at: '2026-06-15T00:00:00.000Z',
       end_at: '2026-07-10T23:59:00.000Z',
     };
-    const account = { balance: 1200, equity: 1250, gain: 25, profit: 250, dd: 4 };
+    const account = {
+      metaapi_metrics_synced_at: '2026-06-15T12:00:00.000Z',
+      balance: 1200,
+      equity: 1250,
+      gain: 25,
+      profit: 250,
+      dd: 4,
+      metaapi_deposits: 1000,
+      metaapi_withdrawals: 0,
+    };
     const entry = { starting_balance: 1000, starting_equity: 1000, peak_equity: 1300, lowest_equity: 980 };
 
-    const metrics = buildContestScopedMetrics(contest, account, entry, []);
+    const result = buildContestScopedMetrics(contest, account, entry, []);
 
-    assert.equal(metrics.gain, 25);
-    assert.equal(metrics.score, 25);
-    assert.equal(metrics.total_lot, 0);
+    assert.equal(result.ok, true);
+    assert.equal(result.metrics.gain, 25);
+    assert.equal(result.metrics.score, 25);
+    assert.equal(result.metrics.total_lot, 0);
   });
 });

@@ -6,6 +6,7 @@ const {
   deriveGainPercentFromDeposits,
   deriveAbsoluteGainPercent,
   mapMetaStatsToAccountMetrics,
+  mergeActivityMetricsInto,
   normalizeDailyGrowthSeries,
   resolveMetastatsPollMaxMs,
   DEFAULT_METASTATS_POLL_MAX_MS,
@@ -276,5 +277,29 @@ describe('resolveMetastatsPollMaxMs', () => {
   it('respects METASTATS_POLL_MAX_MS env override', () => {
     process.env.METASTATS_POLL_MAX_MS = '900000';
     assert.equal(resolveMetastatsPollMaxMs(), 900000);
+  });
+});
+
+describe('mergeActivityMetricsInto', () => {
+  it('does not overwrite MetaStats headline metrics with deal-replay values', () => {
+    const mapped = {
+      gain: -85.64,
+      dd: 10,
+      profit: -1712.8,
+      win_rate: 40,
+      total_trades: 50,
+    };
+    mergeActivityMetricsInto(mapped, {
+      gain: -121.85,
+      dd: 95,
+      profit: -9999,
+      win_rate: 55,
+      total_trades: 60,
+    });
+    assert.equal(mapped.gain, -85.64);
+    assert.equal(mapped.dd, 10);
+    assert.equal(mapped.profit, -1712.8);
+    assert.equal(mapped.win_rate, 55);
+    assert.equal(mapped.total_trades, 60);
   });
 });

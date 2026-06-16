@@ -436,11 +436,13 @@ function isMetaStatsActivityEmpty(mapped) {
 
 function mergeActivityMetricsInto(mapped, derived) {
   if (!derived || typeof derived !== 'object') return mapped;
-  mapped.gain = derived.gain;
-  mapped.dd = derived.dd;
-  mapped.profit = derived.profit;
-  mapped.win_rate = derived.win_rate;
-  mapped.total_trades = derived.total_trades;
+  // Deal replay must not overwrite MetaStats headline metrics (gain/profit/dd).
+  if (derived.win_rate != null && Number.isFinite(Number(derived.win_rate))) {
+    mapped.win_rate = derived.win_rate;
+  }
+  if (derived.total_trades != null && Number.isFinite(Number(derived.total_trades))) {
+    mapped.total_trades = derived.total_trades;
+  }
   return mapped;
 }
 
